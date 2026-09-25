@@ -8,6 +8,7 @@ import {
   assertOfficialPnpmArtifacts,
   assertOfficialUvArtifacts,
   combineFindings,
+  restCheckRollup,
   requiredChecksReady,
   staleCandidateAction,
   updateNpm,
@@ -187,6 +188,21 @@ describe("security remediation inputs", () => {
     ], ["test"])).toEqual(expect.objectContaining({ ready: false }));
   });
 
+  it("normalizes the newest REST check and status results without Actions access", () => {
+    const rollup = restCheckRollup([
+      { id: 1, name: "test", status: "completed", conclusion: "failure" },
+      { id: 2, name: "test", status: "completed", conclusion: "success" },
+      { id: 3, name: "build", status: "in_progress", conclusion: null },
+    ], [
+      { id: 4, context: "policy", state: "failure" },
+      { id: 5, context: "policy", state: "success" },
+    ]);
+    expect(requiredChecksReady(rollup, ["test", "policy"]))
+      .toEqual(expect.objectContaining({ ready: true }));
+    expect(requiredChecksReady(rollup, ["build"]))
+      .toEqual(expect.objectContaining({ ready: false }));
+  });
+
   it("trusts only a successful attestation owned by the current App and head", () => {
     const headSha = "a".repeat(40);
     const receipt = {
@@ -223,6 +239,16 @@ describe("security remediation inputs", () => {
     expect(staleCandidateAction("UNKNOWN")).toBe("wait");
     expect(staleCandidateAction("CLEAN")).toBe("continue");
     expect(staleCandidateAction("BLOCKED")).toBe("continue");
+    expect(staleCandidateAction("behind")).toBe("recreate");
+    expect(staleCandidateAction(null)).toBe("wait");
+  });
+
+  it("does not require the Actions-only GraphQL check-rollup field", () => {
+    const remediation = readFileSync("scripts/security-remediation.mjs", "utf8");
+    expect(remediation).not.toContain("statusCheckRollup,mergeStateStatus");
+    expect(remediation).not.toContain("mergeStateStatus,statusCheckRollup");
+    expect(remediation).toContain("/check-runs?per_page=100");
+    expect(remediation).toContain("/status?per_page=100");
   });
 
   it("binds the public target workflow to live policy and split repository tokens", () => {

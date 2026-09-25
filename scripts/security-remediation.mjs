@@ -548,9 +548,48 @@ export function requiredChecksReady(rollup, requiredChecks) {
 }
 
 export function staleCandidateAction(mergeStateStatus) {
-  if (mergeStateStatus === "BEHIND" || mergeStateStatus === "DIRTY") return "recreate";
-  if (mergeStateStatus === "UNKNOWN") return "wait";
+  const state = String(mergeStateStatus ?? "unknown").toUpperCase();
+  if (state === "BEHIND" || state === "DIRTY") return "recreate";
+  if (state === "UNKNOWN") return "wait";
   return "continue";
+}
+
+export function restCheckRollup(checkRuns, commitStatuses) {
+  const latestChecks = new Map();
+  for (const check of checkRuns ?? []) {
+    const current = latestChecks.get(check.name);
+    if (!current || Number(check.id ?? 0) > Number(current.id ?? 0)) latestChecks.set(check.name, check);
+  }
+  const latestStatuses = new Map();
+  for (const status of commitStatuses ?? []) {
+    const current = latestStatuses.get(status.context);
+    if (!current || Number(status.id ?? 0) > Number(current.id ?? 0)) latestStatuses.set(status.context, status);
+  }
+  return [
+    ...[...latestChecks.values()].map((check) => ({
+      name: check.name,
+      status: String(check.status ?? "").toUpperCase(),
+      conclusion: check.conclusion == null ? null : String(check.conclusion).toUpperCase(),
+    })),
+    ...[...latestStatuses.values()].map((status) => ({
+      context: status.context,
+      state: String(status.state ?? "").toUpperCase(),
+    })),
+  ];
+}
+
+function mergeReadiness(repo, prNumber, headSha) {
+  const pull = gh(["api", `repos/${repo}/pulls/${prNumber}`]);
+  const checkPages = gh(["api", "--paginate", "--slurp",
+    `repos/${repo}/commits/${headSha}/check-runs?per_page=100`]);
+  const combinedStatus = gh(["api", `repos/${repo}/commits/${headSha}/status?per_page=100`]);
+  return {
+    mergeStateStatus: pull?.mergeable == null ? "unknown" : pull.mergeable_state,
+    statusCheckRollup: restCheckRollup(
+      (checkPages ?? []).flatMap((page) => page.check_runs ?? []),
+      combinedStatus?.statuses ?? [],
+    ),
+  };
 }
 
 export function verifiedCandidateAttestation(checkRuns, botSlug, headSha, repo) {
@@ -674,7 +713,7 @@ function reconcile() {
       summary(`- ${pr.html_url}: not merged because of the current project hold.`);
       continue;
     }
-    const detail = gh(["pr", "view", String(pr.number), "--repo", repo, "--json", "mergeStateStatus,statusCheckRollup"]);
+    const detail = mergeReadiness(repo, pr.number, headSha);
     const staleAction = staleCandidateAction(detail?.mergeStateStatus);
     if (staleAction === "recreate") {
       run("gh", ["pr", "close", String(pr.number), "--repo", repo, "--delete-branch"]);
