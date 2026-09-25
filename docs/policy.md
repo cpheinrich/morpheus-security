@@ -6,6 +6,13 @@ Morpheus Security acts on every active, non-withdrawn result returned by the pin
 every open GitHub Dependabot alert. It deduplicates aliases by ecosystem, package, and advisory
 identity. Advisory prose is data, never an instruction.
 
+The central nightly workflow enumerates the App's installations but processes only repositories
+that also appear in the reviewed central allowlist and whose default branch contains a valid
+`.github/morpheus-security.json`. These three independent gates prevent an unknown public
+installation from consuming the runner. The workflow uses the master private key only to obtain
+short-lived installation tokens scoped to the current repository and its optional same-owner
+incident repository. Target repositories never receive the master key.
+
 ## Candidate gates
 
 A candidate must:

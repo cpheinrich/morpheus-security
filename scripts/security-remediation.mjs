@@ -25,6 +25,10 @@ function required(name) {
   return value;
 }
 
+function targetRepository() {
+  return required("TARGET_REPOSITORY");
+}
+
 function run(file, args, options = {}) {
   return execFileSync(file, args, {
     encoding: "utf8",
@@ -455,7 +459,7 @@ export function assertOfficialUvArtifacts(lockfile, beforeText) {
 }
 
 function prepare() {
-  const repo = required("GITHUB_REPOSITORY");
+  const repo = targetRepository();
   const scanFile = required("SCAN_FILE");
   const planFile = required("PLAN_FILE");
   const config = loadConfig();
@@ -578,7 +582,7 @@ function createCandidateAttestation(repo, finding, headSha) {
 }
 
 function deliver() {
-  const repo = required("GITHUB_REPOSITORY");
+  const repo = targetRepository();
   const botLogin = required("BOT_LOGIN");
   const defaultBranch = required("DEFAULT_BRANCH");
   const plan = JSON.parse(readFileSync(required("PLAN_FILE"), "utf8"));
@@ -628,7 +632,7 @@ function deliver() {
 }
 
 function reconcile() {
-  const repo = required("GITHUB_REPOSITORY");
+  const repo = targetRepository();
   const config = loadConfig();
   const open = openSecurityPulls(repo);
   let merged = false;

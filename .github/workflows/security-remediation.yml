@@ -1,93 +1,112 @@
 name: Security remediation
 
-# Reusable, deterministic remediation. The caller owns its nightly trigger and
-# App secrets; Morpheus Security owns scanning, scope validation, and PR delivery.
+# The maintainers' App key lives only in this repository's protected
+# `security-bot` environment. Installed repositories opt in by committing
+# .github/morpheus-security.json; they never receive the App private key.
 on:
-  workflow_call:
-    inputs:
-      config-file:
-        type: string
-        default: .github/morpheus-security.json
-      security-sha:
-        description: Exact 40-character Morpheus Security commit used for reviewed tooling
-        type: string
-        required: true
-    secrets:
-      app_id:
-        required: true
-      app_private_key:
-        required: true
+  schedule:
+    - cron: "43 10 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: security-bot
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+    steps:
+      - name: Check out immutable orchestrator source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Discover opted-in installations
+        id: targets
+        env:
+          MORPHEUS_SECURITY_APP_ID: ${{ secrets.MORPHEUS_SECURITY_APP_ID }}
+          MORPHEUS_SECURITY_PRIVATE_KEY: ${{ secrets.MORPHEUS_SECURITY_PRIVATE_KEY }}
+        run: node scripts/discover-targets.mjs
+
   remediate:
+    needs: discover
+    if: needs.discover.outputs.targets != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        target: ${{ fromJSON(needs.discover.outputs.targets) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment: security-bot
     concurrency:
-      group: morpheus-security-${{ github.repository }}
+      group: morpheus-security-${{ matrix.target.owner }}-${{ matrix.target.name }}
       cancel-in-progress: false
     steps:
-      - name: Mint a target-repository bootstrap token
-        id: bootstrap-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
-        with:
-          app-id: ${{ secrets.app_id }}
-          private-key: ${{ secrets.app_private_key }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-          permission-contents: read
-
-      - name: Check out target main
+      - name: Check out immutable orchestrator tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 0
-          token: ${{ steps.bootstrap-token.outputs.token }}
+          path: tooling
           persist-credentials: false
-
-      - name: Check out Morpheus Security tooling
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: cpheinrich/morpheus-security
-          ref: ${{ inputs.security-sha }}
-          path: .morpheus-security-tooling
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Require an immutable tooling revision
-        env:
-          SECURITY_SHA: ${{ inputs.security-sha }}
-        run: |
-          if ! printf '%s' "$SECURITY_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "security-sha must be an exact 40-character commit" >&2
-            exit 1
-          fi
-          test "$(git -C .morpheus-security-tooling rev-parse HEAD)" = "$SECURITY_SHA"
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
-          package_json_file: .morpheus-security-tooling/package.json
+          package_json_file: tooling/package.json
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
+      - name: Install and compile trusted tooling
+        working-directory: tooling
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Isolate trusted tooling from target configuration
+        run: mv tooling "$RUNNER_TEMP/morpheus-security-tooling"
+
+      - name: Mint a target-repository bootstrap token
+        id: bootstrap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ secrets.MORPHEUS_SECURITY_APP_ID }}
+          private-key: ${{ secrets.MORPHEUS_SECURITY_PRIVATE_KEY }}
+          owner: ${{ matrix.target.owner }}
+          repositories: ${{ matrix.target.name }}
+          permission-contents: read
+
+      - name: Check out target default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ matrix.target.repository }}
+          ref: ${{ matrix.target.defaultBranch }}
+          path: target
+          fetch-depth: 0
+          token: ${{ steps.bootstrap-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Prepare the target receipt directory
+        run: mkdir -p target/.morpheus-security
+
       - name: Resolve the installation-token repository scope
         id: token-scope
+        working-directory: target
         env:
-          CONFIG_FILE: ${{ inputs.config-file }}
-          TARGET_REPOSITORY: ${{ github.repository }}
-        run: node .morpheus-security-tooling/scripts/token-scope.mjs
+          CONFIG_FILE: .github/morpheus-security.json
+          TARGET_REPOSITORY: ${{ matrix.target.repository }}
+        run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/token-scope.mjs"
 
       - name: Mint the least-privilege work token
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
-          app-id: ${{ secrets.app_id }}
-          private-key: ${{ secrets.app_private_key }}
-          owner: ${{ github.repository_owner }}
+          app-id: ${{ secrets.MORPHEUS_SECURITY_APP_ID }}
+          private-key: ${{ secrets.MORPHEUS_SECURITY_PRIVATE_KEY }}
+          owner: ${{ matrix.target.owner }}
           repositories: ${{ steps.token-scope.outputs.repositories }}
           permission-checks: write
           permission-contents: write
@@ -98,35 +117,28 @@ jobs:
 
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
 
-      - name: Install and compile trusted tooling
-        working-directory: .morpheus-security-tooling
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm build
-
-      - name: Isolate tooling from the project scan and diff
-        run: |
-          mv .morpheus-security-tooling "$RUNNER_TEMP/morpheus-security-tooling"
-          mkdir -p .morpheus-security
-
       - name: Reconcile existing bot pull requests
         id: reconcile
+        working-directory: target
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          SECURITY_CONFIG: ${{ inputs.config-file }}
+          SECURITY_CONFIG: .github/morpheus-security.json
           BOT_LOGIN: ${{ steps.app-token.outputs.app-slug }}[bot]
+          TARGET_REPOSITORY: ${{ matrix.target.repository }}
         run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/security-remediation.mjs" reconcile
 
       - name: Refresh the trusted default branch before scanning
         if: steps.reconcile.outputs.merged != 'true'
+        working-directory: target
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DEFAULT_BRANCH: ${{ matrix.target.defaultBranch }}
+          TARGET_REPOSITORY: ${{ matrix.target.repository }}
         run: |
           gh auth setup-git
           git fetch --no-tags origin "$DEFAULT_BRANCH"
           git checkout --detach "origin/$DEFAULT_BRANCH"
-          LIVE_SHA="$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
+          LIVE_SHA="$(gh api "repos/$TARGET_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
           test "$(git rev-parse HEAD)" = "$LIVE_SHA"
 
       - name: Scan trusted main with OSV
@@ -137,23 +149,25 @@ jobs:
         with:
           scan-args: |-
             --format=json
-            --output=.morpheus-security/before.json
+            --output=target/.morpheus-security/before.json
             --recursive
-            ./
+            target/
 
       - name: Require a scanner result
         if: steps.reconcile.outputs.merged != 'true'
-        run: test -s .morpheus-security/before.json
+        run: test -s target/.morpheus-security/before.json
 
       - name: Prepare one non-conflicting dependency update
         if: steps.reconcile.outputs.merged != 'true'
         id: prepare
+        working-directory: target
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SCAN_FILE: .morpheus-security/before.json
           PLAN_FILE: .morpheus-security/plan.json
-          SECURITY_CONFIG: ${{ inputs.config-file }}
+          SECURITY_CONFIG: .github/morpheus-security.json
           BOT_LOGIN: ${{ steps.app-token.outputs.app-slug }}[bot]
+          TARGET_REPOSITORY: ${{ matrix.target.repository }}
         run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/security-remediation.mjs" prepare
 
       - name: Rescan candidate with OSV
@@ -164,29 +178,31 @@ jobs:
         with:
           scan-args: |-
             --format=json
-            --output=.morpheus-security/after.json
+            --output=target/.morpheus-security/after.json
             --recursive
-            ./
+            target/
 
       - name: Deliver candidate pull request
         if: steps.reconcile.outputs.merged != 'true' && steps.prepare.outputs.changed == 'true'
+        working-directory: target
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PLAN_FILE: .morpheus-security/plan.json
           AFTER_SCAN_FILE: .morpheus-security/after.json
           BOT_LOGIN: ${{ steps.app-token.outputs.app-slug }}[bot]
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DEFAULT_BRANCH: ${{ matrix.target.defaultBranch }}
+          TARGET_REPOSITORY: ${{ matrix.target.repository }}
         run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/security-remediation.mjs" deliver
 
       - name: Upload the run receipt
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: morpheus-security-receipt
+          name: morpheus-security-${{ matrix.target.owner }}-${{ matrix.target.name }}
           path: |
-            .morpheus-security/before.json
-            .morpheus-security/after.json
-            .morpheus-security/plan.json
+            target/.morpheus-security/before.json
+            target/.morpheus-security/after.json
+            target/.morpheus-security/plan.json
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 30

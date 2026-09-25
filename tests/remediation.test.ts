@@ -207,5 +207,7 @@ describe("security remediation inputs", () => {
     expect(refresh).toBeGreaterThan(reconcile);
     expect(scan).toBeGreaterThan(refresh);
     expect(workflow).toContain('test "$(git rev-parse HEAD)" = "$LIVE_SHA"');
+    expect(workflow).toContain("TARGET_REPOSITORY: ${{ matrix.target.repository }}");
+    expect(workflow).not.toContain("secrets.app_private_key");
   });
 });

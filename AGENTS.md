@@ -21,5 +21,7 @@ independent review. Never commit a GitHub App private key. Commits created for C
 Co-authored-by: Codex <codex@cpheinrich.com>
 ```
 
-The public repository distributes source code, policy, and a reusable workflow. It does not offer
-a hosted service. Outside operators register their own GitHub App and retain their own private key.
+The public repository operates the public-but-unlisted App from one protected GitHub environment.
+Installed repositories never receive the master private key. Preserve central credential custody,
+per-target installation tokens, committed opt-in policy, and protected-main review as one trust
+boundary. Self-hosting operators register their own App and retain their own central private key.
