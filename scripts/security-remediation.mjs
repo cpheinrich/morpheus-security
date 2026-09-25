@@ -233,6 +233,18 @@ function installedNpmVersion(lockfile, dependency) {
   return versions.length === 1 ? versions[0] : null;
 }
 
+function removeInstalledNpmVersion(lockfile, dependency, installedVersion) {
+  const lock = JSON.parse(readFileSync(lockfile, "utf8"));
+  const suffix = `/node_modules/${dependency}`;
+  for (const [path, entry] of Object.entries(lock.packages ?? {})) {
+    if ((path === `node_modules/${dependency}` || path.endsWith(suffix)) && entry.version === installedVersion) {
+      delete lock.packages[path];
+    }
+  }
+  if (lock.dependencies?.[dependency]?.version === installedVersion) delete lock.dependencies[dependency];
+  writeFileSync(lockfile, `${JSON.stringify(lock, null, 2)}\n`);
+}
+
 function advanceFlatOverride(overrides, dependency, installedVersion, fixedVersion) {
   let changed = false;
   for (const [selector, target] of Object.entries(overrides ?? {})) {
@@ -277,7 +289,8 @@ export function updateNpm(finding) {
   // that existing rule instead of adding an unreachable second selector.
   if (advanceFlatOverride(manifest.overrides, finding.dependency, finding.version, finding.fixedVersion)) {
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-    packageRun("npm", ["update", finding.dependency, "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
+    removeInstalledNpmVersion(finding.sourcePath, finding.dependency, finding.version);
+    packageRun("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
     return { strategy: "transitive-override-advanced", manifestPath: relative(process.cwd(), manifestPath) };
   }
 

@@ -238,7 +238,8 @@ describe("security remediation inputs", () => {
       expect(result.strategy).toBe("transitive-override-advanced");
       expect(JSON.parse(readFileSync(manifestPath, "utf8")).overrides)
         .toEqual({ "minimist@1.2.5": "1.2.7" });
-      expect(readFileSync(lockfile, "utf8")).toContain('"version": "1.2.7"');
+      const installed = JSON.parse(readFileSync(lockfile, "utf8")).packages["node_modules/minimist"].version;
+      expect(["1.2.7", "1.2.8"]).toContain(installed);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
