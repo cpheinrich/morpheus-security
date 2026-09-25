@@ -284,7 +284,7 @@ describe("security remediation inputs", () => {
     expect(remediation).toContain("/statuses?per_page=100");
   });
 
-  it("binds the public target workflow to live policy and split repository tokens", () => {
+  it("binds the public target workflow to live policy and one repository token", () => {
     const workflow = readFileSync(".github/workflows/security-remediation.yml", "utf8");
     const reconcile = workflow.indexOf("name: Reconcile existing bot pull requests");
     const refresh = workflow.indexOf("name: Refresh and authenticate the live default branch");
@@ -302,7 +302,8 @@ describe("security remediation inputs", () => {
     expect(workflow).toContain("TARGET_REPOSITORY: ${{ inputs.target-repository }}");
     expect(workflow).toContain("repositories: ${{ inputs.target-name }}");
     expect(workflow).toContain("permission-issues: write");
-    expect(workflow).toContain("INCIDENT_GH_TOKEN: ${{ steps.incident-token.outputs.token }}");
+    expect(workflow).not.toContain("INCIDENT_GH_TOKEN");
+    expect(workflow).not.toContain("incident-token");
     expect(workflow).toContain("ref: ${{ inputs.security-sha }}");
   });
 });

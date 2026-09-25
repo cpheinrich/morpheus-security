@@ -32,8 +32,7 @@ webhooks, and Actions access are disabled.
 {
   "version": 1,
   "holds": [],
-  "requiredChecks": ["test"],
-  "incidentRepository": null
+  "requiredChecks": ["test"]
 }
 ```
 
@@ -45,9 +44,9 @@ file. Removing the policy file opts the repository out without changing the inst
 list permits scans and PR creation but disables automatic merging. Branch protection and review
 rules remain additional GitHub-enforced gates.
 
-For a public repository, create a private incident repository under the same owner, include it in
-the App installation, and set `incidentRepository` to its `owner/name`. This prevents malware
-exposure details from being published in a public issue.
+Malware advisories create or update an incident issue in the affected repository. For public
+repositories, that issue is necessarily public and contains only non-secret advisory and dependency
+facts plus the response checklist. Keep credentials and sensitive investigation details elsewhere.
 
 The next nightly run picks up the repository. A new PR is never merged in its creation run. The App
 records a Check Run attestation for the exact validated head; a later run requires that attestation
@@ -59,8 +58,8 @@ security-fix PRs; keep Dependabot alerts enabled.
 
 The maintainers keep the App private key only as an Actions secret in the private operations
 repository, with an offline recovery copy in a credential vault. GitHub stores only the public
-portion. The central workflow exchanges the key for short-lived, least-privilege tokens scoped to
-one target repository and its optional incident repository, then revokes its discovery tokens.
+portion. The central workflow exchanges the key for a short-lived, least-privilege token scoped to
+one target repository, then revokes its discovery token.
 
 The private key grants authority across every installation. Install only if you trust the App's
 maintainers and reviewed workflow with the selected repositories. To retain that authority

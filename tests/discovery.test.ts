@@ -26,7 +26,7 @@ describe("central installation discovery", () => {
   it("queries only allowlisted repositories and requires matching live policy", async () => {
     const calls: Array<{ url: string; method: string; authorization: string | null; body?: string }> = [];
     const config = Buffer.from(JSON.stringify({
-      version: 1, holds: [], requiredChecks: ["test"], incidentRepository: "cpheinrich/incidents",
+      version: 1, holds: [], requiredChecks: ["test"],
     })).toString("base64");
     const fetchImpl = async (input: string | URL | Request, options: RequestInit = {}) => {
       const url = String(input);
@@ -34,7 +34,6 @@ describe("central installation discovery", () => {
       const headers = new Headers(options.headers);
       calls.push({ url, method, authorization: headers.get("authorization"), body: String(options.body ?? "") });
       if (url.endsWith("/repos/cpheinrich/lakinacapital/installation")) return json({ id: 42, suspended_at: null });
-      if (url.endsWith("/repos/cpheinrich/incidents/installation")) return json({ id: 42, suspended_at: null });
       if (url.endsWith("/app/installations/42/access_tokens")) return json({ token: "installation-token" });
       if (url.endsWith("/repos/cpheinrich/lakinacapital")) return json({ default_branch: "main" });
       if (url.includes("repos/cpheinrich/lakinacapital/contents/.github/morpheus-security.json")) {
@@ -47,7 +46,7 @@ describe("central installation discovery", () => {
     await expect(discoverTargets({
       appId: "5075643",
       privateKey,
-      approved: [{ repository: "cpheinrich/lakinacapital", incidentRepository: "cpheinrich/incidents" }],
+      approved: [{ repository: "cpheinrich/lakinacapital" }],
       fetchImpl,
       now: 1_700_000_000,
     })).resolves.toEqual([{
@@ -55,9 +54,6 @@ describe("central installation discovery", () => {
       owner: "cpheinrich",
       name: "lakinacapital",
       defaultBranch: "main",
-      incidentRepository: "cpheinrich/incidents",
-      incidentOwner: "cpheinrich",
-      incidentName: "incidents",
     }]);
     expect(calls.some((call) => call.url.includes("/app/installations?"))).toBe(false);
     expect(calls.find((call) => call.url.endsWith("/access_tokens"))?.body)
@@ -85,8 +81,8 @@ describe("central installation discovery", () => {
       appId: "5075643",
       privateKey,
       approved: [
-        { repository: "cpheinrich/missing", incidentRepository: null },
-        { repository: "cpheinrich/unsafe", incidentRepository: null },
+        { repository: "cpheinrich/missing" },
+        { repository: "cpheinrich/unsafe" },
       ],
       fetchImpl,
       now: 1_700_000_000,

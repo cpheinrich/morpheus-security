@@ -80,7 +80,7 @@ function loadConfig() {
   if (config?.version !== 1 || !Array.isArray(config.holds) ||
       !Array.isArray(config.requiredChecks) ||
       !config.requiredChecks.every((name) => typeof name === "string" && name.trim() === name && name.length > 0) ||
-      !(config.incidentRepository === null || typeof config.incidentRepository === "string")) {
+      config.incidentRepository != null) {
     throw new Error("Security config must explicitly define version 1 and valid holds/requiredChecks arrays");
   }
   return config;
@@ -144,41 +144,23 @@ function ensureLabel(repo, name, color, description, token = process.env.GH_TOKE
   }
 }
 
-export function incidentRepository(repo, config) {
-  const visibility = run("gh", ["api", `repos/${repo}`, "--jq", ".visibility"]);
-  if (visibility === "public") {
-    if (!config.incidentRepository) throw new Error("Public repositories require a private incidentRepository");
-  }
-  const target = config.incidentRepository ?? repo;
-  const incidentToken = target === repo ? process.env.GH_TOKEN : required("INCIDENT_GH_TOKEN");
-  const targetVisibility = run("gh", ["api", `repos/${target}`, "--jq", ".visibility"], {
-    env: { ...process.env, GH_TOKEN: incidentToken },
-  });
-  if (targetVisibility !== "private") {
-    throw new Error(`Malware incident repository must be private: ${target}`);
-  }
-  return target;
-}
-
-function upsertMalwareIncident(repo, finding, config) {
-  const target = incidentRepository(repo, config);
-  const incidentToken = target === repo ? process.env.GH_TOKEN : required("INCIDENT_GH_TOKEN");
-  for (const label of INCIDENT_LABELS) ensureLabel(target, ...label, incidentToken);
+function upsertMalwareIncident(repo, finding) {
+  for (const label of INCIDENT_LABELS) ensureLabel(repo, ...label);
   const marker = `<!-- morpheus-malware-incident:${findingKey(finding)} -->`;
-  const pages = gh(["api", "--paginate", "--slurp", `repos/${target}/issues?state=all&labels=dependency-malware&per_page=100`], incidentToken);
+  const pages = gh(["api", "--paginate", "--slurp", `repos/${repo}/issues?state=all&labels=dependency-malware&per_page=100`]);
   const existing = (pages ?? []).flatMap((page) => page).find((issue) => String(issue.body ?? "").includes(marker));
   const body = `${marker}\n\nMorpheus Security detected malicious package advisory **${finding.advisory}** for ` +
     `\`${finding.dependency}@${finding.version}\` in \`${repo}\` (\`${finding.sourcePath}\`).\n\n` +
     `Automated remediation is being attempted separately. This incident remains open until a human records whether the affected package was installed or executed, what credentials were exposed, and what rotation or containment was completed.\n\n` +
     `Advisory: https://osv.dev/vulnerability/${finding.advisory}`;
   if (existing) {
-    gh(["api", "--method", "PATCH", `repos/${target}/issues/${existing.number}`, "-f", `body=${body}`], incidentToken);
+    gh(["api", "--method", "PATCH", `repos/${repo}/issues/${existing.number}`, "-f", `body=${body}`]);
     return existing.html_url;
   }
-  const created = gh(["api", "--method", "POST", `repos/${target}/issues`,
+  const created = gh(["api", "--method", "POST", `repos/${repo}/issues`,
     "-f", `title=[Security incident] ${finding.advisory} in ${finding.dependency}`,
     "-f", `body=${body}`,
-    ...INCIDENT_LABELS.flatMap(([name]) => ["-f", `labels[]=${name}`])], incidentToken);
+    ...INCIDENT_LABELS.flatMap(([name]) => ["-f", `labels[]=${name}`])]);
   return created.html_url;
 }
 
@@ -485,7 +467,7 @@ function prepare() {
   const open = openSecurityPulls(repo);
 
   for (const finding of findings.filter((candidate) => candidate.malicious)) {
-    finding.incidentUrl = upsertMalwareIncident(repo, finding, config);
+    finding.incidentUrl = upsertMalwareIncident(repo, finding);
   }
 
   const openLockfiles = new Set(open.map((pr) => /Lockfile: `([^`]+)`/.exec(pr.body ?? "")?.[1]).filter(Boolean));

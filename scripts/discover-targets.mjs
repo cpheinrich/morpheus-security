@@ -44,8 +44,7 @@ function validateConfig(config, approved) {
   if (config?.version !== 1 || !Array.isArray(config.holds) ||
       !Array.isArray(config.requiredChecks) ||
       !config.requiredChecks.every((name) => typeof name === "string" && name.trim() === name && name.length > 0) ||
-      !(config.incidentRepository === null || typeof config.incidentRepository === "string") ||
-      config.incidentRepository !== approved.incidentRepository) {
+      config.incidentRepository != null) {
     throw new Error(`${approved.repository} has an invalid or unapproved ${CONFIG_PATH}`);
   }
 }
@@ -53,11 +52,9 @@ function validateConfig(config, approved) {
 export function approvedRepositories(path = APPROVED_PATH) {
   const entries = JSON.parse(readFileSync(path, "utf8"));
   if (!Array.isArray(entries) || entries.length === 0 || entries.some((entry) =>
-    !entry || !REPOSITORY.test(entry.repository ?? "") ||
-    !(entry.incidentRepository === null || REPOSITORY.test(entry.incidentRepository ?? "")) ||
-    (entry.incidentRepository && entry.incidentRepository.split("/")[0] !== entry.repository.split("/")[0])) ||
+    !entry || !REPOSITORY.test(entry.repository ?? "") || Object.keys(entry).some((key) => key !== "repository")) ||
     new Set(entries.map((entry) => entry.repository)).size !== entries.length) {
-    throw new Error(`${path} must contain unique repository and approved same-owner incidentRepository entries`);
+    throw new Error(`${path} must contain unique repository entries`);
   }
   return entries;
 }
@@ -82,14 +79,6 @@ export async function discoverTargets({
         warn(`${entry.repository} was skipped because the App installation is unavailable`);
         continue;
       }
-      if (entry.incidentRepository) {
-        const incidentInstallation = await request(fetchImpl,
-          `/repos/${entry.incidentRepository}/installation`, jwt, { allowNotFound: true });
-        if (!incidentInstallation || incidentInstallation.id !== installation.id) {
-          warn(`${entry.repository} was skipped because its approved incident repository is not in the same installation`);
-          continue;
-        }
-      }
       const [, name] = entry.repository.split("/");
       const tokenBody = await request(fetchImpl, `/app/installations/${installation.id}/access_tokens`, jwt, {
         method: "POST",
@@ -108,15 +97,11 @@ export async function discoverTargets({
       const config = JSON.parse(Buffer.from(configBody.content, "base64").toString("utf8"));
       validateConfig(config, entry);
       const [owner, repositoryName] = entry.repository.split("/");
-      const [incidentOwner = "", incidentName = ""] = entry.incidentRepository?.split("/") ?? [];
       targets.push({
         repository: entry.repository,
         owner,
         name: repositoryName,
         defaultBranch: repository.default_branch,
-        incidentRepository: entry.incidentRepository ?? "",
-        incidentOwner,
-        incidentName,
       });
     } catch (error) {
       warn(`${entry.repository} was skipped: ${String(error.message ?? error)}`);

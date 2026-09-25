@@ -17,15 +17,6 @@ on:
       default-branch:
         type: string
         required: true
-      incident-repository:
-        type: string
-        default: ""
-      incident-owner:
-        type: string
-        default: ""
-      incident-name:
-        type: string
-        default: ""
       security-sha:
         description: Exact reviewed Morpheus Security commit
         type: string
@@ -106,14 +97,13 @@ jobs:
       - name: Prepare the target receipt directory
         run: mkdir -p target/.morpheus-security
 
-      - name: Validate target identity and incident scope
+      - name: Validate target identity and policy
         working-directory: target
         env:
           CONFIG_FILE: .github/morpheus-security.json
           TARGET_REPOSITORY: ${{ inputs.target-repository }}
           TARGET_OWNER: ${{ inputs.target-owner }}
           TARGET_NAME: ${{ inputs.target-name }}
-          APPROVED_INCIDENT_REPOSITORY: ${{ inputs.incident-repository }}
         run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/token-scope.mjs"
 
       - name: Mint the least-privilege target token
@@ -130,17 +120,6 @@ jobs:
           permission-pull-requests: write
           permission-statuses: read
           permission-vulnerability-alerts: read
-
-      - name: Mint an issues-only incident token
-        if: inputs.incident-name != ''
-        id: incident-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
-        with:
-          app-id: ${{ secrets.app_id }}
-          private-key: ${{ secrets.app_private_key }}
-          owner: ${{ inputs.incident-owner }}
-          repositories: ${{ inputs.incident-name }}
-          permission-issues: write
 
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
 
@@ -165,7 +144,6 @@ jobs:
           TARGET_REPOSITORY: ${{ inputs.target-repository }}
           TARGET_OWNER: ${{ inputs.target-owner }}
           TARGET_NAME: ${{ inputs.target-name }}
-          APPROVED_INCIDENT_REPOSITORY: ${{ inputs.incident-repository }}
         run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/token-scope.mjs"
 
       - name: Reconcile existing bot pull requests
@@ -210,7 +188,6 @@ jobs:
         working-directory: target
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          INCIDENT_GH_TOKEN: ${{ steps.incident-token.outputs.token }}
           SCAN_FILE: .morpheus-security/before.json
           PLAN_FILE: .morpheus-security/plan.json
           SECURITY_CONFIG: .github/morpheus-security.json

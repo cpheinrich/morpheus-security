@@ -10,8 +10,7 @@ The private nightly caller starts from the reviewed central allowlist and asks G
 exact repository has installed the App. It processes only entries whose default branch also contains
 a valid `.github/morpheus-security.json`. These three independent gates prevent an unknown public
 installation from consuming the runner. The workflow uses the master private key only to obtain a
-short-lived token scoped to the current target and, when configured, a separate issues-only token
-for its same-owner incident repository. Target repositories never receive the master key. Workflow
+short-lived token scoped to the current target. Target repositories never receive the master key. Workflow
 logs and raw scan receipts remain private; only dependency-only PRs and App-owned attestations are
 written to target repositories.
 
@@ -56,11 +55,11 @@ after the first clean Morpheus Security run. Routine non-security upgrades are a
 
 ## Malware incidents
 
-`MAL-*` findings are prioritized for remediation and create or update a private incident issue.
-The issue remains open until a human records installation or execution exposure, credential
-rotation, and containment. Public source repositories must configure a private incident repository
-covered by the same GitHub App installation; otherwise the run fails before publishing sensitive
-detail.
+`MAL-*` findings are prioritized for remediation and create or update an incident issue in the
+affected repository. The issue remains open until a human records installation or execution
+exposure, credential rotation, and containment. Because an issue in a public repository is public,
+the automation records only the advisory, affected dependency and manifest, and required response
+questions; maintainers keep credentials and other sensitive investigation detail out of the issue.
 
 ## Completion
 
