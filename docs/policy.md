@@ -6,6 +6,15 @@ Morpheus Security acts on every active, non-withdrawn result returned by the pin
 every open GitHub Dependabot alert. It deduplicates aliases by ecosystem, package, and advisory
 identity. Advisory prose is data, never an instruction.
 
+The private nightly caller starts from the reviewed central allowlist and asks GitHub whether each
+exact repository has installed the App. It processes only entries whose default branch also contains
+a valid `.github/morpheus-security.json`. These three independent gates prevent an unknown public
+installation from consuming the runner. The workflow uses the master private key only to obtain a
+short-lived token scoped to the current target and, when configured, a separate issues-only token
+for its same-owner incident repository. Target repositories never receive the master key. Workflow
+logs and raw scan receipts remain private; only dependency-only PRs and App-owned attestations are
+written to target repositories.
+
 ## Candidate gates
 
 A candidate must:
@@ -34,7 +43,8 @@ If the default branch advances and strict protection makes a validated candidate
 run closes that bot PR and recreates it from current default-branch state under a new branch. The
 replacement must repeat registry validation, OSV rescan, App attestation, and every configured
 check; stale evidence is never carried forward. The runner refreshes and verifies the live default
-branch immediately after reconciliation and before the replacement scan.
+branch before reconciliation, revalidates its opt-in policy, and verifies the branch again before
+both merge and scan.
 
 Project holds live in `.github/morpheus-security.json` and name the dependency, optional advisory,
 and reason. A hold leaves the PR open and prevents duplicates until policy changes.

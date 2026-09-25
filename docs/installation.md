@@ -1,8 +1,8 @@
 # Installation
 
-Morpheus Security is self-hosted inside GitHub Actions. Register a GitHub App under the account that
-owns the target repositories. If one App must span unrelated accounts, its registration must be
-public; it does not need to be listed in GitHub Marketplace.
+Morpheus Security is a centrally operated, public-but-unlisted GitHub App. Its reviewed engine is
+public, while its nightly caller, logs, artifacts, and sole App private key live in a separate
+private operations repository. Installers do not receive or configure the private key.
 
 ## GitHub App permissions
 
@@ -16,23 +16,17 @@ public; it does not need to be listed in GitHub Marketplace.
 | Issues | Read and write |
 | Pull requests | Read and write |
 
-Grant no organization or account permissions. Leave OAuth user authorization, Device Flow, and
-webhooks disabled.
+The App has no organization or account permissions. OAuth user authorization, Device Flow,
+webhooks, and Actions access are disabled.
 
-Generate a private key and store these encrypted repository secrets:
+## Install and opt in
 
-- `MORPHEUS_SECURITY_APP_ID`
-- `MORPHEUS_SECURITY_PRIVATE_KEY`
-
-Delete the downloaded key after the secret is verified. Never commit or distribute it.
-
-The private key proves the App's identity. Its holder can exchange a signed JWT for one-hour tokens
-covering any installation and repository permissions granted to the App. A compromised key can
-therefore affect every installation; rotate it immediately if exposure is suspected.
-
-## Repository policy
-
-Create `.github/morpheus-security.json`:
+1. Install `morpheus-security` on **only select repositories**. An installation grants the App
+   access but does not provide its private key to the installer.
+2. Ask a maintainer to add the exact `owner/name` to `config/approved-repositories.json`. This
+   reviewed allowlist prevents an unknown public installation from consuming or attacking the
+   central runner.
+3. Commit `.github/morpheus-security.json` to each repository that should run nightly:
 
 ```json
 {
@@ -43,42 +37,40 @@ Create `.github/morpheus-security.json`:
 }
 ```
 
-`requiredChecks` is the explicit merge allowlist. Use the exact GitHub check names that must pass
-for a dependency PR. An empty list still permits scanning and PR creation but disables automatic
-merging. This gate works even when branch protection is absent; any branch protection or review
-rule remains an additional GitHub-enforced gate.
+Installation alone is inert. The central workflow processes a repository only when the App is
+installed, the central allowlist approves it, and its default branch contains this valid policy
+file. Removing the policy file opts the repository out without changing the installation.
 
-For a public repository, set `incidentRepository` to a private repository owned by the same App
-installation and include that repository when installing the App.
+`requiredChecks` is the explicit automatic-merge allowlist. Use exact GitHub check names. An empty
+list permits scans and PR creation but disables automatic merging. Branch protection and review
+rules remain additional GitHub-enforced gates.
 
-## Caller
+For a public repository, create a private incident repository under the same owner, include it in
+the App installation, and set `incidentRepository` to its `owner/name`. This prevents malware
+exposure details from being published in a public issue.
 
-Pin both the reusable workflow and `security-sha` to the same reviewed commit:
+The next nightly run picks up the repository. A new PR is never merged in its creation run. The App
+records a Check Run attestation for the exact validated head; a later run requires that attestation
+and all configured checks before atomically merging that head. A further run must confirm that the
+main-branch graph is clean and GitHub has closed the alert. Only then disable Dependabot automatic
+security-fix PRs; keep Dependabot alerts enabled.
 
-```yaml
-name: Security remediation
+## Credential custody and self-hosting
 
-on:
-  schedule:
-    - cron: "43 10 * * *"
-  workflow_dispatch:
+The maintainers keep the App private key only as an Actions secret in the private operations
+repository, with an offline recovery copy in a credential vault. GitHub stores only the public
+portion. The central workflow exchanges the key for short-lived, least-privilege tokens scoped to
+one target repository and its optional incident repository, then revokes its discovery tokens.
 
-permissions:
-  contents: read
+The private key grants authority across every installation. Install only if you trust the App's
+maintainers and reviewed workflow with the selected repositories. To retain that authority
+yourself, fork this repository, register a separate GitHub App with the permissions above, and
+store your own App ID and private key once in a private, protected operations repository as:
 
-jobs:
-  remediate:
-    uses: cpheinrich/morpheus-security/.github/workflows/security-remediation.yml@<reviewed-sha>
-    with:
-      security-sha: <reviewed-sha>
-      config-file: .github/morpheus-security.json
-    secrets:
-      app_id: ${{ secrets.MORPHEUS_SECURITY_APP_ID }}
-      app_private_key: ${{ secrets.MORPHEUS_SECURITY_PRIVATE_KEY }}
-```
+- `MORPHEUS_SECURITY_APP_ID`
+- `MORPHEUS_SECURITY_PRIVATE_KEY`
 
-Dispatch once manually. A new PR is never merged in its creation run. The App records a Check Run
-attestation for the exact validated head. After the named checks pass, the next nightly or manual
-reconciliation requires that App-owned attestation and atomically merges only that head. Dispatch again
-until the main-branch receipt is clean and the corresponding GitHub alert closes. Only then
-disable Dependabot automatic security-fix PRs; keep Dependabot alerts enabled.
+Never commit or distribute the private key. Require pull-request review and passing CI for changes
+to the public engine and private caller. Use only scheduled or `repository_dispatch` triggers so
+secrets cannot be requested from an arbitrary branch. Rotate the key immediately if exposure is
+suspected.

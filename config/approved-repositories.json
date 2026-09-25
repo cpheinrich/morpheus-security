@@ -1,0 +1,14 @@
+[
+  {
+    "repository": "cpheinrich/lakinacapital",
+    "incidentRepository": null
+  },
+  {
+    "repository": "cpheinrich/morpheus",
+    "incidentRepository": "cpheinrich/morpheus-security-incidents"
+  },
+  {
+    "repository": "darwin-health/evo",
+    "incidentRepository": null
+  }
+]
