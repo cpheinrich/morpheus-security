@@ -89,7 +89,7 @@ jobs:
           private-key: ${{ secrets.app_private_key }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ steps.token-scope.outputs.repositories }}
-          permission-checks: read
+          permission-checks: write
           permission-contents: write
           permission-issues: write
           permission-pull-requests: write

@@ -11,6 +11,7 @@ import {
   requiredChecksReady,
   updateNpm,
   updatePnpm,
+  verifiedCandidateAttestation,
 // @ts-expect-error operational JavaScript intentionally ships outside the TypeScript build
 } from "../scripts/security-remediation.mjs";
 
@@ -156,5 +157,35 @@ describe("security remediation inputs", () => {
     expect(requiredChecksReady([
       { name: "test", status: "IN_PROGRESS", conclusion: null },
     ], ["test"])).toEqual(expect.objectContaining({ ready: false }));
+  });
+
+  it("trusts only a successful attestation owned by the current App and head", () => {
+    const headSha = "a".repeat(40);
+    const receipt = {
+      version: 1,
+      repository: "cpheinrich/example",
+      headSha,
+      dependency: "yaml",
+      advisory: "GHSA-example",
+      aliases: ["GHSA-example"],
+      sourcePath: "pnpm-lock.yaml",
+    };
+    const check = {
+      id: 42,
+      name: "Morpheus Security / candidate",
+      head_sha: headSha,
+      app: { slug: "example-security" },
+      status: "completed",
+      conclusion: "success",
+      output: { summary: JSON.stringify(receipt) },
+    };
+    expect(verifiedCandidateAttestation([check], "example-security", headSha, "cpheinrich/example"))
+      .toEqual(receipt);
+    expect(verifiedCandidateAttestation([check], "other-app", headSha, "cpheinrich/example")).toBeNull();
+    expect(verifiedCandidateAttestation([check], "example-security", "b".repeat(40), "cpheinrich/example"))
+      .toBeNull();
+    expect(verifiedCandidateAttestation([
+      { ...check, output: { summary: JSON.stringify({ ...receipt, dependency: "other" }) }, app: { slug: "other-app" } },
+    ], "example-security", headSha, "cpheinrich/example")).toBeNull();
   });
 });

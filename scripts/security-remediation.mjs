@@ -17,6 +17,7 @@ const INCIDENT_LABELS = [
   ["automated", "1f883d", "Created by automation"],
   ["needs-exposure-review", "d4c5f9", "Human exposure assessment required"],
 ];
+const CANDIDATE_CHECK = "Morpheus Security / candidate";
 
 function required(name) {
   const value = process.env[name];
@@ -118,7 +119,7 @@ function openSecurityPulls(repo) {
   const botLogin = required("BOT_LOGIN");
   const pages = gh(["api", "--paginate", "--slurp", `repos/${repo}/pulls?state=open&per_page=100`]);
   return (pages ?? []).flatMap((page) => page).filter((pr) =>
-    pr.user?.login === botLogin && String(pr.body ?? "").includes(SECURITY_MARKER));
+    pr.user?.login === botLogin && String(pr.head?.ref ?? "").startsWith("morpheus-security/"));
 }
 
 function held(finding, config) {
@@ -530,6 +531,46 @@ export function requiredChecksReady(rollup, requiredChecks) {
   return { ready: true, reason: "all explicit required checks passed" };
 }
 
+export function verifiedCandidateAttestation(checkRuns, botSlug, headSha, repo) {
+  const candidates = (checkRuns ?? []).filter((check) =>
+    check.name === CANDIDATE_CHECK && check.head_sha === headSha && check.app?.slug === botSlug &&
+    check.status === "completed" && check.conclusion === "success");
+  for (const check of candidates.sort((left, right) => Number(right.id ?? 0) - Number(left.id ?? 0))) {
+    try {
+      const receipt = JSON.parse(check.output?.summary ?? "");
+      if (receipt.version === 1 && receipt.repository === repo && receipt.headSha === headSha &&
+          typeof receipt.dependency === "string" && receipt.dependency.length > 0 &&
+          typeof receipt.advisory === "string" && Array.isArray(receipt.aliases) &&
+          receipt.aliases.every((alias) => typeof alias === "string") &&
+          typeof receipt.sourcePath === "string" && receipt.sourcePath.length > 0) {
+        return receipt;
+      }
+    } catch {
+      // Ignore malformed or unrelated check output and fail closed below.
+    }
+  }
+  return null;
+}
+
+function createCandidateAttestation(repo, finding, headSha) {
+  const receipt = JSON.stringify({
+    version: 1,
+    repository: repo,
+    headSha,
+    dependency: finding.dependency,
+    advisory: finding.advisory,
+    aliases: finding.aliases,
+    sourcePath: finding.sourcePath,
+  });
+  gh(["api", "--method", "POST", `repos/${repo}/check-runs`,
+    "-f", `name=${CANDIDATE_CHECK}`,
+    "-f", `head_sha=${headSha}`,
+    "-f", "status=completed",
+    "-f", "conclusion=success",
+    "-f", "output[title]=Validated security dependency candidate",
+    "-f", `output[summary]=${receipt}`]);
+}
+
 function deliver() {
   const repo = required("GITHUB_REPOSITORY");
   const botLogin = required("BOT_LOGIN");
@@ -560,6 +601,7 @@ function deliver() {
   const candidateHead = run("git", ["rev-parse", "HEAD"]);
   run("gh", ["auth", "setup-git"]);
   run("git", ["push", "--set-upstream", "origin", branch]);
+  createCandidateAttestation(repo, finding, candidateHead);
   ensureSecurityLabels(repo);
   const incident = finding.incidentUrl ? `\nRelated incident: ${finding.incidentUrl}` : "";
   const body = `${SECURITY_MARKER}\n\n## Summary\n\n` +
@@ -585,20 +627,20 @@ function reconcile() {
   const open = openSecurityPulls(repo);
   let merged = false;
   for (const pr of open) {
-    const dependency = /Dependency: `([^`]+)`/.exec(pr.body ?? "")?.[1];
-    const aliases = /Advisories: ([^\n]+)/.exec(pr.body ?? "")?.[1]
-      ?.split(",").map((value) => /`([^`]+)`/.exec(value)?.[1]).filter(Boolean) ?? [];
-    if (!dependency || aliases.length === 0) {
-      summary(`- ${pr.html_url}: not merged because its policy metadata is incomplete.`);
+    const headSha = pr.head?.sha;
+    if (!/^[0-9a-f]{40}$/.test(headSha ?? "")) {
+      summary(`- ${pr.html_url}: not merged because its head is invalid.`);
       continue;
     }
-    if (held({ dependency, aliases }, config)) {
+    const checkRuns = gh(["api", `repos/${repo}/commits/${headSha}/check-runs?check_name=${encodeURIComponent(CANDIDATE_CHECK)}`]);
+    const botSlug = required("BOT_LOGIN").replace(/\[bot\]$/, "");
+    const attestation = verifiedCandidateAttestation(checkRuns?.check_runs, botSlug, headSha, repo);
+    if (!attestation) {
+      summary(`- ${pr.html_url}: not merged because no valid App-owned candidate attestation covers its head.`);
+      continue;
+    }
+    if (held({ dependency: attestation.dependency, aliases: attestation.aliases }, config)) {
       summary(`- ${pr.html_url}: not merged because of the current project hold.`);
-      continue;
-    }
-    const expectedHead = /Candidate head: `([0-9a-f]{40})`/.exec(pr.body ?? "")?.[1];
-    if (!expectedHead || pr.head?.sha !== expectedHead) {
-      summary(`- ${pr.html_url}: not merged because the candidate head does not match its immutable receipt.`);
       continue;
     }
     const detail = gh(["pr", "view", String(pr.number), "--repo", repo, "--json", "statusCheckRollup"]);
@@ -608,7 +650,8 @@ function reconcile() {
       continue;
     }
     try {
-      run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--squash", "--delete-branch"]);
+      run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--match-head-commit", headSha,
+        "--squash", "--delete-branch"]);
       merged = true;
       summary(`- ${pr.html_url}: merged after every explicit required check passed.`);
     } catch (error) {

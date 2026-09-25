@@ -9,7 +9,7 @@ public; it does not need to be listed in GitHub Marketplace.
 | Repository permission | Access |
 |---|---|
 | Metadata | Read |
-| Checks | Read |
+| Checks | Read and write |
 | Commit statuses | Read |
 | Dependabot alerts | Read |
 | Contents | Read and write |
@@ -77,7 +77,8 @@ jobs:
       app_private_key: ${{ secrets.MORPHEUS_SECURITY_PRIVATE_KEY }}
 ```
 
-Dispatch once manually. A new PR is never merged in its creation run. After its named checks pass,
-the next nightly or manual reconciliation verifies the immutable head and merges it. Dispatch again
+Dispatch once manually. A new PR is never merged in its creation run. The App records a Check Run
+attestation for the exact validated head. After the named checks pass, the next nightly or manual
+reconciliation requires that App-owned attestation and atomically merges only that head. Dispatch again
 until the main-branch receipt is clean and the corresponding GitHub alert closes. Only then
 disable Dependabot automatic security-fix PRs; keep Dependabot alerts enabled.

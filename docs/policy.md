@@ -24,11 +24,11 @@ runs with builds disabled and accepts changed artifacts only from hashed PyPI re
 ## Pull requests and merges
 
 One dependency is one pull request. At most one bot PR is open per lockfile, so updates cannot race
-the same lock graph. The creation run records the exact candidate head and never merges it. A later
-nightly reconciliation merges only when the head is unchanged and every explicitly configured
-`requiredChecks` entry has passed. An empty check list disables automatic merging. Branch
-protection and review rules remain additional authority. Human-authored PRs never receive the bot
-waiver.
+the same lock graph. The creation run records an App-owned Check Run attestation for the exact
+candidate head and never merges it. A later nightly reconciliation requires that attestation,
+requires every explicitly configured `requiredChecks` entry to have passed, and atomically limits
+the merge to that head. An empty check list disables automatic merging. Branch protection and
+review rules remain additional authority. Human-authored PRs never receive the bot waiver.
 
 Project holds live in `.github/morpheus-security.json` and name the dependency, optional advisory,
 and reason. A hold leaves the PR open and prevents duplicates until policy changes.
