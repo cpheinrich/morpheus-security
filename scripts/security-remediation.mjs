@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parse, parseDocument } from "yaml";
@@ -33,6 +33,27 @@ function run(file, args, options = {}) {
   }).trim();
 }
 
+function packageManagerEnvironment() {
+  const environment = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (!/(?:token|secret|password|credential|auth|private.?key)/i.test(name) &&
+        !/^(?:npm_config|uv|pip)_.+(?:index|registry|cert|key|proxy)/i.test(name) &&
+        !/^(?:https?_proxy|all_proxy|no_proxy|node_extra_ca_certs|ssl_cert_file|requests_ca_bundle)$/i.test(name)) {
+      environment[name] = value;
+    }
+  }
+  return {
+    ...environment,
+    NPM_CONFIG_REGISTRY: "https://registry.npmjs.org/",
+    NPM_CONFIG_USERCONFIG: "/dev/null",
+    UV_DEFAULT_INDEX: "https://pypi.org/simple",
+  };
+}
+
+function packageRun(file, args, options = {}) {
+  return run(file, args, { ...options, env: packageManagerEnvironment() });
+}
+
 function gh(args) {
   const output = run("gh", args);
   return output ? JSON.parse(output) : null;
@@ -49,12 +70,14 @@ function summary(markdown) {
 
 function loadConfig() {
   const path = process.env.SECURITY_CONFIG ?? ".github/morpheus-security.json";
-  if (!existsSync(path)) return { version: 1, holds: [], incidentRepository: null };
+  if (!existsSync(path)) return { version: 1, holds: [], requiredChecks: [], incidentRepository: null };
   const config = JSON.parse(readFileSync(path, "utf8"));
-  if (config?.version !== 1 || !Array.isArray(config.holds ?? [])) {
-    throw new Error("Security config must have version 1 and an optional holds array");
+  if (config?.version !== 1 || !Array.isArray(config.holds ?? []) ||
+      !Array.isArray(config.requiredChecks ?? []) ||
+      !(config.requiredChecks ?? []).every((name) => typeof name === "string" && name.trim() === name && name.length > 0)) {
+    throw new Error("Security config must have version 1 and holds/requiredChecks arrays");
   }
-  return { holds: [], incidentRepository: null, ...config };
+  return { holds: [], requiredChecks: [], incidentRepository: null, ...config };
 }
 
 function dependabotFindings(repo) {
@@ -92,9 +115,10 @@ export function combineFindings(osv, github) {
 }
 
 function openSecurityPulls(repo) {
+  const botLogin = required("BOT_LOGIN");
   const pages = gh(["api", "--paginate", "--slurp", `repos/${repo}/pulls?state=open&per_page=100`]);
   return (pages ?? []).flatMap((page) => page).filter((pr) =>
-    pr.user?.login === "morpheus-security[bot]" && String(pr.body ?? "").includes(SECURITY_MARKER));
+    pr.user?.login === botLogin && String(pr.body ?? "").includes(SECURITY_MARKER));
 }
 
 function held(finding, config) {
@@ -152,6 +176,38 @@ function packageRoot(lockfile) {
   return dirname(resolve(lockfile));
 }
 
+function assertOfficialNpmConfiguration(root) {
+  const npmrcFiles = [];
+  const visit = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.name === ".git" || entry.name === "node_modules") continue;
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile() && entry.name === ".npmrc") npmrcFiles.push(path);
+    }
+  };
+  visit(root);
+  for (const path of npmrcFiles) {
+    const text = readFileSync(path, "utf8");
+    if (/^\s*(?:@[^:]+:)?registry\s*=/im.test(text) ||
+        /^\s*[^#]*(?:_auth|authToken|password|certfile|keyfile)\s*=/im.test(text)) {
+      throw new Error(`Refusing repository registry or credential configuration in ${relative(root, path)}`);
+    }
+  }
+  const workspacePath = join(root, "pnpm-workspace.yaml");
+  if (existsSync(workspacePath)) {
+    const workspace = parse(readFileSync(workspacePath, "utf8"));
+    if (workspace?.registries || workspace?.networkConfig) {
+      throw new Error("Refusing custom pnpm registry configuration");
+    }
+  }
+}
+
+function registryArgs(dependency) {
+  const scope = /^(@[^/]+)\//.exec(dependency)?.[1];
+  return ["--registry=https://registry.npmjs.org/", ...(scope ? [`--${scope}:registry=https://registry.npmjs.org/`] : [])];
+}
+
 function installedNpmVersion(lockfile, dependency) {
   const lock = JSON.parse(readFileSync(lockfile, "utf8"));
   const suffix = `/node_modules/${dependency}`;
@@ -161,8 +217,9 @@ function installedNpmVersion(lockfile, dependency) {
   return versions.length === 1 ? versions[0] : null;
 }
 
-function updateNpm(finding) {
+export function updateNpm(finding) {
   const root = packageRoot(finding.sourcePath);
+  assertOfficialNpmConfiguration(root);
   const manifestPath = join(root, "package.json");
   if (!existsSync(manifestPath)) throw new Error(`No package.json beside ${finding.sourcePath}`);
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -172,20 +229,23 @@ function updateNpm(finding) {
     if (!direct) throw new Error(`Malicious transitive ${finding.dependency} has no fixed version; incident opened but automatic removal is unsafe`);
     delete manifest[direct][finding.dependency];
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-    run("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: root });
+    packageRun("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
     return { strategy: "remove-malicious-direct", manifestPath: relative(process.cwd(), manifestPath) };
   }
   if (!finding.fixedVersion) throw new Error(`${finding.advisory} has no fixed version`);
   if (direct) {
     const current = manifest[direct][finding.dependency];
-    const prefix = typeof current === "string" && /^[~^]/.test(current) ? current[0] : "";
+    if (typeof current !== "string" || !/^[~^]?\d/.test(current)) {
+      throw new Error(`Refusing unsupported npm direct specifier for ${finding.dependency}: ${String(current)}`);
+    }
+    const prefix = /^[~^]/.test(current) ? current[0] : "";
     manifest[direct][finding.dependency] = `${prefix}${finding.fixedVersion}`;
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-    run("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: root });
+    packageRun("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
     return { strategy: "direct", manifestPath: relative(process.cwd(), manifestPath) };
   }
 
-  run("npm", ["update", finding.dependency, "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: root });
+  packageRun("npm", ["update", finding.dependency, "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
   const updated = installedNpmVersion(finding.sourcePath, finding.dependency);
   if (updated && updated !== finding.version) return { strategy: "transitive-compatible", manifestPath: null };
 
@@ -194,7 +254,7 @@ function updateNpm(finding) {
   const refreshed = JSON.parse(readFileSync(manifestPath, "utf8"));
   refreshed.overrides = { ...(refreshed.overrides ?? {}), [finding.dependency]: finding.fixedVersion };
   writeFileSync(manifestPath, `${JSON.stringify(refreshed, null, 2)}\n`);
-  run("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: root });
+  packageRun("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
   return { strategy: "transitive-override", manifestPath: relative(process.cwd(), manifestPath) };
 }
 
@@ -202,7 +262,7 @@ function updateUv(finding) {
   if (!finding.fixedVersion) throw new Error(`${finding.advisory} has no fixed version`);
   const root = packageRoot(finding.sourcePath);
   const beforeLock = readFileSync(finding.sourcePath, "utf8");
-  run("uv", ["lock", "--upgrade-package", `${finding.dependency}>=${finding.fixedVersion}`], { cwd: root });
+  packageRun("uv", ["lock", "--no-build", "--default-index", "https://pypi.org/simple", "--upgrade-package", `${finding.dependency}>=${finding.fixedVersion}`], { cwd: root });
   return { strategy: "uv-lock", manifestPath: null, beforeLock };
 }
 
@@ -250,6 +310,7 @@ function writePnpmOverride(root, dependency, fixedVersion) {
 
 export function updatePnpm(finding) {
   const root = packageRoot(finding.sourcePath);
+  assertOfficialNpmConfiguration(root);
   const beforeLock = readFileSync(finding.sourcePath, "utf8");
   const direct = pnpmDirectManifests(finding.sourcePath, finding.dependency);
   if (finding.malicious && !finding.fixedVersion) {
@@ -258,7 +319,7 @@ export function updatePnpm(finding) {
       delete entry.manifest[entry.group][finding.dependency];
       writeFileSync(entry.manifestPath, `${JSON.stringify(entry.manifest, null, 2)}\n`);
     }
-    run("pnpm", ["install", "--lockfile-only", "--ignore-scripts"], { cwd: root });
+    packageRun("pnpm", ["install", "--lockfile-only", "--ignore-scripts", ...registryArgs(finding.dependency)], { cwd: root });
     return { strategy: "remove-malicious-direct", manifestPath: direct.map((entry) => relative(process.cwd(), entry.manifestPath)).join(","), beforeLock };
   }
   if (!finding.fixedVersion) throw new Error(`${finding.advisory} has no fixed version`);
@@ -272,16 +333,16 @@ export function updatePnpm(finding) {
       entry.manifest[entry.group][finding.dependency] = `${prefix}${finding.fixedVersion}`;
       writeFileSync(entry.manifestPath, `${JSON.stringify(entry.manifest, null, 2)}\n`);
     }
-    run("pnpm", ["install", "--lockfile-only", "--ignore-scripts"], { cwd: root });
+    packageRun("pnpm", ["install", "--lockfile-only", "--ignore-scripts", ...registryArgs(finding.dependency)], { cwd: root });
     return { strategy: "pnpm-direct", manifestPath: direct.map((entry) => relative(process.cwd(), entry.manifestPath)).join(","), beforeLock };
   }
 
-  run("pnpm", ["update", `${finding.dependency}@${finding.fixedVersion}`, "--recursive", "--lockfile-only", "--ignore-scripts"], { cwd: root });
+  packageRun("pnpm", ["update", `${finding.dependency}@${finding.fixedVersion}`, "--recursive", "--lockfile-only", "--ignore-scripts", ...registryArgs(finding.dependency)], { cwd: root });
   const updated = installedPnpmVersion(finding.sourcePath, finding.dependency);
   if (updated && updated !== finding.version) return { strategy: "pnpm-transitive-compatible", manifestPath: null, beforeLock };
 
   const manifestPath = writePnpmOverride(root, finding.dependency, finding.fixedVersion);
-  run("pnpm", ["install", "--lockfile-only", "--ignore-scripts"], { cwd: root });
+  packageRun("pnpm", ["install", "--lockfile-only", "--ignore-scripts", ...registryArgs(finding.dependency)], { cwd: root });
   return { strategy: "pnpm-transitive-override", manifestPath, beforeLock };
 }
 
@@ -313,7 +374,20 @@ export function assertOfficialNpmArtifacts(lockfile, beforeText) {
   }
 }
 
-export function assertOfficialPnpmArtifacts(lockfile, beforeText) {
+function officialPnpmRelease(key) {
+  const separator = key.lastIndexOf("@");
+  const dependency = key.slice(0, separator);
+  const version = key.slice(separator + 1).split("(")[0];
+  if (separator <= 0 || !dependency || !version) throw new Error(`Cannot resolve pnpm package identity: ${key}`);
+  const output = packageRun("npm", ["view", `${dependency}@${version}`, "dist.integrity", "dist.tarball", "--json", ...registryArgs(dependency)]);
+  const metadata = JSON.parse(output);
+  return {
+    integrity: metadata.integrity ?? metadata["dist.integrity"],
+    tarball: metadata.tarball ?? metadata["dist.tarball"],
+  };
+}
+
+export function assertOfficialPnpmArtifacts(lockfile, beforeText, releaseLookup = officialPnpmRelease) {
   const before = parse(beforeText)?.packages ?? {};
   const after = pnpmLock(lockfile)?.packages ?? {};
   for (const [key, entry] of Object.entries(after)) {
@@ -330,6 +404,13 @@ export function assertOfficialPnpmArtifacts(lockfile, beforeText) {
     }
     if (typeof resolution.integrity !== "string" || !/^sha(?:256|384|512)-/.test(resolution.integrity)) {
       throw new Error(`Refusing pnpm artifact without a recognized integrity hash: ${key}`);
+    }
+    const official = releaseLookup(key);
+    if (official?.integrity !== resolution.integrity) {
+      throw new Error(`Refusing pnpm artifact whose integrity does not match registry.npmjs.org: ${key}`);
+    }
+    if (resolution.tarball && official?.tarball !== resolution.tarball) {
+      throw new Error(`Refusing pnpm artifact whose tarball does not match registry.npmjs.org: ${key}`);
     }
   }
 }
@@ -435,8 +516,24 @@ function ensureSecurityLabels(repo) {
   ]) ensureLabel(repo, ...label);
 }
 
+export function requiredChecksReady(rollup, requiredChecks) {
+  if (!Array.isArray(requiredChecks) || requiredChecks.length === 0) {
+    return { ready: false, reason: "no explicit requiredChecks policy" };
+  }
+  for (const requiredCheck of requiredChecks) {
+    const matches = (rollup ?? []).filter((check) => (check.name ?? check.context) === requiredCheck);
+    if (matches.length === 0) return { ready: false, reason: `required check is missing: ${requiredCheck}` };
+    const successful = matches.every((check) =>
+      check.status === "COMPLETED" ? check.conclusion === "SUCCESS" : check.state === "SUCCESS");
+    if (!successful) return { ready: false, reason: `required check has not passed: ${requiredCheck}` };
+  }
+  return { ready: true, reason: "all explicit required checks passed" };
+}
+
 function deliver() {
   const repo = required("GITHUB_REPOSITORY");
+  const botLogin = required("BOT_LOGIN");
+  const defaultBranch = required("DEFAULT_BRANCH");
   const plan = JSON.parse(readFileSync(required("PLAN_FILE"), "utf8"));
   const after = findingsFromOsvJson(JSON.parse(readFileSync(required("AFTER_SCAN_FILE"), "utf8")));
   const finding = plan.finding;
@@ -454,12 +551,14 @@ function deliver() {
     return;
   }
   const branch = `morpheus-security/${slug(finding.ecosystem)}-${slug(finding.dependency)}-${slug(finding.advisory)}`;
-  run("git", ["config", "user.name", "morpheus-security[bot]"]);
-  run("git", ["config", "user.email", "morpheus-security[bot]@users.noreply.github.com"]);
+  run("git", ["config", "user.name", botLogin]);
+  run("git", ["config", "user.email", `${botLogin.replace(/\[bot\]$/, "")}[bot]@users.noreply.github.com`]);
   run("git", ["switch", "-c", branch]);
   run("git", ["add", "--", ...changedFiles]);
   run("git", ["commit", "-m", `fix(deps): remediate ${finding.dependency} ${finding.advisory}`,
     "-m", "Co-authored-by: Codex <codex@cpheinrich.com>"]);
+  const candidateHead = run("git", ["rev-parse", "HEAD"]);
+  run("gh", ["auth", "setup-git"]);
   run("git", ["push", "--set-upstream", "origin", branch]);
   ensureSecurityLabels(repo);
   const incident = finding.incidentUrl ? `\nRelated incident: ${finding.incidentUrl}` : "";
@@ -469,42 +568,55 @@ function deliver() {
     `- Remediate ${finding.advisory} (${finding.aliases.join(", ")}).\n` +
     `- Update \`${finding.version}\` to the smallest available fixed line, \`${finding.fixedVersion ?? "removed"}\`, using \`${plan.update.strategy}\`.\n` +
     `- OSV rescanned the candidate and no longer reports this package/advisory pair.\n` +
-    `- Registry URLs and lockfile integrity hashes passed the deterministic supply-chain gate.${incident}\n\n` +
-    `## Test plan\n\nRequired repository checks and deployment previews must pass before GitHub auto-merge.\n\n` +
+    `- Registry URLs and lockfile integrity hashes passed the deterministic supply-chain gate.\n` +
+    `- Candidate head: \`${candidateHead}\`.${incident}\n\n` +
+    `## Test plan\n\nThe configured required checks must pass before a later reconciliation run merges this PR.\n\n` +
     `## Open questions\n\nNone.\n`;
-  const url = run("gh", ["pr", "create", "--repo", repo, "--base", "main", "--head", branch,
+  const url = run("gh", ["pr", "create", "--repo", repo, "--base", defaultBranch, "--head", branch,
     "--title", `fix(deps): remediate ${finding.dependency} security advisory`, "--body", body,
     "--label", "security", "--label", "dependencies", "--label", "automated-security"]);
-  run("gh", ["pr", "merge", url, "--repo", repo, "--auto", "--squash", "--delete-branch"]);
   output("pull_request", url);
-  summary(`## Security remediation\n\nOpened ${url} for ${finding.dependency} and enabled auto-merge behind repository checks.`);
+  summary(`## Security remediation\n\nOpened ${url} for ${finding.dependency}. A later run will merge it only after the explicit required checks pass.`);
 }
 
 function reconcile() {
   const repo = required("GITHUB_REPOSITORY");
   const config = loadConfig();
   const open = openSecurityPulls(repo);
+  let merged = false;
   for (const pr of open) {
     const dependency = /Dependency: `([^`]+)`/.exec(pr.body ?? "")?.[1];
     const aliases = /Advisories: ([^\n]+)/.exec(pr.body ?? "")?.[1]
       ?.split(",").map((value) => /`([^`]+)`/.exec(value)?.[1]).filter(Boolean) ?? [];
     if (!dependency || aliases.length === 0) {
-      run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--disable-auto"]);
-      summary(`- ${pr.html_url}: auto-merge disabled because its policy metadata is incomplete.`);
+      summary(`- ${pr.html_url}: not merged because its policy metadata is incomplete.`);
       continue;
     }
     if (held({ dependency, aliases }, config)) {
-      run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--disable-auto"]);
-      summary(`- ${pr.html_url}: auto-merge disabled by the current project hold.`);
+      summary(`- ${pr.html_url}: not merged because of the current project hold.`);
+      continue;
+    }
+    const expectedHead = /Candidate head: `([0-9a-f]{40})`/.exec(pr.body ?? "")?.[1];
+    if (!expectedHead || pr.head?.sha !== expectedHead) {
+      summary(`- ${pr.html_url}: not merged because the candidate head does not match its immutable receipt.`);
+      continue;
+    }
+    const detail = gh(["pr", "view", String(pr.number), "--repo", repo, "--json", "statusCheckRollup"]);
+    const readiness = requiredChecksReady(detail?.statusCheckRollup, config.requiredChecks);
+    if (!readiness.ready) {
+      summary(`- ${pr.html_url}: waiting; ${readiness.reason}.`);
       continue;
     }
     try {
-      run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--auto", "--squash", "--delete-branch"]);
+      run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--squash", "--delete-branch"]);
+      merged = true;
+      summary(`- ${pr.html_url}: merged after every explicit required check passed.`);
     } catch (error) {
-      summary(`- ${pr.html_url}: auto-merge not advanced (${String(error.stderr ?? error.message).trim()})`);
+      summary(`- ${pr.html_url}: merge rejected by GitHub (${String(error.stderr ?? error.message).trim()})`);
     }
   }
   output("open_prs", String(open.length));
+  output("merged", String(merged));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

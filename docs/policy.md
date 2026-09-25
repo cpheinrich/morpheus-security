@@ -17,13 +17,18 @@ A candidate must:
 5. pass every required repository check before merge.
 
 Missing evidence fails closed. Registry-to-git, URL, or local-path source changes are rejected.
+npm and pnpm run with scripts disabled, public npmjs configuration forced, secrets removed from
+their subprocess environment, and changed pnpm integrity checked against registry.npmjs.org. uv
+runs with builds disabled and accepts changed artifacts only from hashed PyPI releases.
 
 ## Pull requests and merges
 
 One dependency is one pull request. At most one bot PR is open per lockfile, so updates cannot race
-the same lock graph. Nightly reconciliation advances or waits on an existing bot PR before opening
-new work. The bot enables auto-merge only after its deterministic gates pass; branch protection is
-the final authority. Human-authored PRs never receive the bot waiver.
+the same lock graph. The creation run records the exact candidate head and never merges it. A later
+nightly reconciliation merges only when the head is unchanged and every explicitly configured
+`requiredChecks` entry has passed. An empty check list disables automatic merging. Branch
+protection and review rules remain additional authority. Human-authored PRs never receive the bot
+waiver.
 
 Project holds live in `.github/morpheus-security.json` and name the dependency, optional advisory,
 and reason. A hold leaves the PR open and prevents duplicates until policy changes.

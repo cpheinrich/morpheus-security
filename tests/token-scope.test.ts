@@ -23,4 +23,15 @@ describe("installation token scope", () => {
       "cpheinrich/morpheus",
     )).toThrow("under the target repository owner");
   });
+
+  it("rejects control characters before writing the workflow output", () => {
+    expect(() => tokenRepositories(
+      { version: 1, holds: [], incidentRepository: "cpheinrich/incidents\nsecret-repo" },
+      "cpheinrich/morpheus",
+    )).toThrow("under the target repository owner");
+    expect(() => tokenRepositories(
+      { version: 1, holds: [], incidentRepository: null },
+      "cpheinrich/morpheus\r\nextra",
+    )).toThrow("safe GitHub owner/name");
+  });
 });

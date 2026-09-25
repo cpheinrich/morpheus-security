@@ -6,7 +6,7 @@
 
 Deterministic OSV and GitHub advisory remediation for GitHub repositories. It runs as a nightly or
 manually dispatched GitHub Action, opens one dependency-only pull request at a time per lockfile,
-and lets the repository's protected-branch checks retain final merge authority.
+and merges only on a later run after the repository's explicitly named checks pass.
 
 Morpheus Security uses no model, OpenAI API, local agent, or paid service.
 

@@ -8,6 +8,8 @@ import {
   assertOfficialPnpmArtifacts,
   assertOfficialUvArtifacts,
   combineFindings,
+  requiredChecksReady,
+  updateNpm,
   updatePnpm,
 // @ts-expect-error operational JavaScript intentionally ships outside the TypeScript build
 } from "../scripts/security-remediation.mjs";
@@ -72,7 +74,14 @@ describe("security remediation inputs", () => {
     expect(() => assertOfficialPnpmArtifacts(lockfile, before)).toThrow("without a recognized integrity hash");
 
     writeFileSync(lockfile, "lockfileVersion: '9.0'\npackages:\n  safe@1.0.0:\n    resolution:\n      integrity: sha512-abc\n");
-    expect(() => assertOfficialPnpmArtifacts(lockfile, before)).not.toThrow();
+    expect(() => assertOfficialPnpmArtifacts(lockfile, before, () => ({
+      integrity: "sha512-abc",
+      tarball: "https://registry.npmjs.org/safe/-/safe-1.0.0.tgz",
+    }))).not.toThrow();
+    expect(() => assertOfficialPnpmArtifacts(lockfile, before, () => ({
+      integrity: "sha512-other",
+      tarball: "https://registry.npmjs.org/safe/-/safe-1.0.0.tgz",
+    }))).toThrow("does not match registry.npmjs.org");
 
     writeFileSync(lockfile, "lockfileVersion: '9.0'\npackages:\n  unsafe@1.0.0:\n    resolution:\n      tarball: https://evil.example/unsafe.tgz\n      integrity: sha512-abc\n");
     expect(() => assertOfficialPnpmArtifacts(lockfile, before)).toThrow("non-registry pnpm artifact");
@@ -90,6 +99,7 @@ describe("security remediation inputs", () => {
       writeFileSync(join(dir, "pnpm-workspace.yaml"), "packages: []\n");
       execFileSync("pnpm", ["install", "--lockfile-only", "--ignore-scripts"], { cwd: dir, stdio: "ignore" });
       const lockfile = join(dir, "pnpm-lock.yaml");
+      const beforeLock = readFileSync(lockfile, "utf8");
       const result = updatePnpm({
         ecosystem: "npm",
         dependency: "yaml",
@@ -105,8 +115,46 @@ describe("security remediation inputs", () => {
       expect(result.strategy).toBe("pnpm-direct");
       expect(manifest.dependencies.yaml).toBe("2.9.1");
       expect(readFileSync(lockfile, "utf8")).toContain("yaml@2.9.1");
+      expect(() => assertOfficialPnpmArtifacts(lockfile, beforeLock)).not.toThrow();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it("rejects repository registry overrides and non-registry direct specs", () => {
+    const pnpmDir = mkdtempSync(join(tmpdir(), "morpheus-security-pnpm-config-"));
+    const npmDir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-spec-"));
+    try {
+      writeFileSync(join(pnpmDir, "package.json"), `${JSON.stringify({
+        name: "unsafe-pnpm-fixture", private: true, dependencies: { yaml: "2.9.0" },
+      })}\n`);
+      writeFileSync(join(pnpmDir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\nimporters:\n  .: {}\npackages: {}\n");
+      writeFileSync(join(pnpmDir, ".npmrc"), "registry=https://evil.example/\n");
+      expect(() => updatePnpm({ ...osv, dependency: "yaml", fixedVersion: "2.9.1", sourcePath: join(pnpmDir, "pnpm-lock.yaml") }))
+        .toThrow("registry or credential configuration");
+
+      writeFileSync(join(npmDir, "package.json"), `${JSON.stringify({
+        name: "unsafe-npm-fixture", private: true, dependencies: { uuid: "git+https://example.com/uuid.git" },
+      })}\n`);
+      writeFileSync(join(npmDir, "package-lock.json"), `${JSON.stringify({ lockfileVersion: 3, packages: {} })}\n`);
+      expect(() => updateNpm({ ...osv, sourcePath: join(npmDir, "package-lock.json") }))
+        .toThrow("unsupported npm direct specifier");
+    } finally {
+      rmSync(pnpmDir, { recursive: true, force: true });
+      rmSync(npmDir, { recursive: true, force: true });
+    }
+  });
+
+  it("merges only after every explicitly named check passes", () => {
+    const rollup = [
+      { name: "test", status: "COMPLETED", conclusion: "SUCCESS" },
+      { context: "policy", state: "SUCCESS" },
+    ];
+    expect(requiredChecksReady(rollup, [])).toEqual(expect.objectContaining({ ready: false }));
+    expect(requiredChecksReady(rollup, ["missing"])).toEqual(expect.objectContaining({ ready: false }));
+    expect(requiredChecksReady(rollup, ["test", "policy"])).toEqual(expect.objectContaining({ ready: true }));
+    expect(requiredChecksReady([
+      { name: "test", status: "IN_PROGRESS", conclusion: null },
+    ], ["test"])).toEqual(expect.objectContaining({ ready: false }));
+  });
 });

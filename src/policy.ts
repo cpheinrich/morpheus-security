@@ -1,7 +1,6 @@
 import { existsSync } from "node:fs";
 import { isAbsolute, relative } from "node:path";
 
-export const MORPHEUS_SECURITY_LOGIN = "morpheus-security[bot]";
 export const SECURITY_MARKER = "<!-- morpheus-security-update -->";
 
 export interface SecurityFinding {

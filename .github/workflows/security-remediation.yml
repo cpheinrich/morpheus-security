@@ -37,14 +37,15 @@ jobs:
           private-key: ${{ secrets.app_private_key }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-          permission-contents: write
+          permission-contents: read
 
       - name: Check out target main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: main
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           token: ${{ steps.bootstrap-token.outputs.token }}
+          persist-credentials: false
 
       - name: Check out Morpheus Security tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -88,7 +89,6 @@ jobs:
           private-key: ${{ secrets.app_private_key }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ steps.token-scope.outputs.repositories }}
-          permission-actions: read
           permission-checks: read
           permission-contents: write
           permission-issues: write
@@ -110,12 +110,15 @@ jobs:
           mkdir -p .morpheus-security
 
       - name: Reconcile existing bot pull requests
+        id: reconcile
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SECURITY_CONFIG: ${{ inputs.config-file }}
+          BOT_LOGIN: ${{ steps.app-token.outputs.app-slug }}[bot]
         run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/security-remediation.mjs" reconcile
 
       - name: Scan trusted main with OSV
+        if: steps.reconcile.outputs.merged != 'true'
         id: scan-before
         continue-on-error: true
         uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
@@ -127,19 +130,22 @@ jobs:
             ./
 
       - name: Require a scanner result
+        if: steps.reconcile.outputs.merged != 'true'
         run: test -s .morpheus-security/before.json
 
       - name: Prepare one non-conflicting dependency update
+        if: steps.reconcile.outputs.merged != 'true'
         id: prepare
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SCAN_FILE: .morpheus-security/before.json
           PLAN_FILE: .morpheus-security/plan.json
           SECURITY_CONFIG: ${{ inputs.config-file }}
+          BOT_LOGIN: ${{ steps.app-token.outputs.app-slug }}[bot]
         run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/security-remediation.mjs" prepare
 
       - name: Rescan candidate with OSV
-        if: steps.prepare.outputs.changed == 'true'
+        if: steps.reconcile.outputs.merged != 'true' && steps.prepare.outputs.changed == 'true'
         id: scan-after
         continue-on-error: true
         uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
@@ -151,11 +157,13 @@ jobs:
             ./
 
       - name: Deliver candidate pull request
-        if: steps.prepare.outputs.changed == 'true'
+        if: steps.reconcile.outputs.merged != 'true' && steps.prepare.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PLAN_FILE: .morpheus-security/plan.json
           AFTER_SCAN_FILE: .morpheus-security/after.json
+          BOT_LOGIN: ${{ steps.app-token.outputs.app-slug }}[bot]
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/security-remediation.mjs" deliver
 
       - name: Upload the run receipt

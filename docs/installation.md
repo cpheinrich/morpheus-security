@@ -9,7 +9,6 @@ public; it does not need to be listed in GitHub Marketplace.
 | Repository permission | Access |
 |---|---|
 | Metadata | Read |
-| Actions | Read |
 | Checks | Read |
 | Commit statuses | Read |
 | Dependabot alerts | Read |
@@ -39,9 +38,15 @@ Create `.github/morpheus-security.json`:
 {
   "version": 1,
   "holds": [],
+  "requiredChecks": ["test"],
   "incidentRepository": null
 }
 ```
+
+`requiredChecks` is the explicit merge allowlist. Use the exact GitHub check names that must pass
+for a dependency PR. An empty list still permits scanning and PR creation but disables automatic
+merging. This gate works even when branch protection is absent; any branch protection or review
+rule remains an additional GitHub-enforced gate.
 
 For a public repository, set `incidentRepository` to a private repository owned by the same App
 installation and include that repository when installing the App.
@@ -72,6 +77,7 @@ jobs:
       app_private_key: ${{ secrets.MORPHEUS_SECURITY_PRIVATE_KEY }}
 ```
 
-Dispatch once manually. Follow each bot PR through required checks and auto-merge, then dispatch
-again until the main-branch receipt is clean and the corresponding GitHub alert closes. Only then
+Dispatch once manually. A new PR is never merged in its creation run. After its named checks pass,
+the next nightly or manual reconciliation verifies the immutable head and merges it. Dispatch again
+until the main-branch receipt is clean and the corresponding GitHub alert closes. Only then
 disable Dependabot automatic security-fix PRs; keep Dependabot alerts enabled.
