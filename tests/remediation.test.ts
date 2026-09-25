@@ -187,6 +187,59 @@ describe("security remediation inputs", () => {
       expect(packages).toContain("brace-expansion@5.0.6");
       expect(readFileSync(join(dir, "pnpm-workspace.yaml"), "utf8"))
         .toContain("brace-expansion@1.1.15: 1.1.16");
+
+      const advanced = updatePnpm({
+        ecosystem: "npm",
+        dependency: "brace-expansion",
+        version: "1.1.16",
+        advisory: "GHSA-follow-up",
+        aliases: ["GHSA-follow-up"],
+        fixedVersion: "1.1.17",
+        sourcePath: lockfile,
+        malicious: false,
+        withdrawn: false,
+      });
+      const advancedWorkspace = readFileSync(join(dir, "pnpm-workspace.yaml"), "utf8");
+      expect(advanced.strategy).toBe("pnpm-transitive-override-advanced");
+      expect(advancedWorkspace).toContain("brace-expansion@1.1.15: 1.1.17");
+      expect(advancedWorkspace).not.toContain("brace-expansion@1.1.16:");
+      expect(readFileSync(lockfile, "utf8").split("\npackages:\n")[1])
+        .toContain("brace-expansion@1.1.17");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("advances an existing npm security override instead of chaining it", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-advance-"));
+    try {
+      const manifestPath = join(dir, "package.json");
+      writeFileSync(manifestPath, `${JSON.stringify({
+        name: "npm-security-advance-fixture",
+        private: true,
+        dependencies: { mkdirp: "0.5.5" },
+        overrides: { "minimist@1.2.5": "1.2.6" },
+      }, null, 2)}\n`);
+      execFileSync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], {
+        cwd: dir,
+        stdio: "ignore",
+      });
+      const lockfile = join(dir, "package-lock.json");
+      expect(readFileSync(lockfile, "utf8")).toContain('"version": "1.2.6"');
+
+      const result = updateNpm({
+        ...osv,
+        dependency: "minimist",
+        version: "1.2.6",
+        fixedVersion: "1.2.7",
+        sourcePath: lockfile,
+      });
+
+      expect(result.strategy).toBe("transitive-override-advanced");
+      expect(JSON.parse(readFileSync(manifestPath, "utf8")).overrides)
+        .toEqual({ "minimist@1.2.5": "1.2.7" });
+      const installed = JSON.parse(readFileSync(lockfile, "utf8")).packages["node_modules/minimist"].version;
+      expect(["1.2.7", "1.2.8"]).toContain(installed);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -31,7 +31,9 @@ runs with builds disabled and accepts changed artifacts only from hashed PyPI re
 An explicit repository `.npmrc` is accepted only when its registry entries name
 `https://registry.npmjs.org/` and it contains no credential configuration.
 When a transitive npm or pnpm parent range cannot reach a fix, the generated override is scoped to
-the vulnerable installed version so parallel incompatible major lines are not collapsed.
+the vulnerable installed version so parallel incompatible major lines are not collapsed. If a later
+advisory requires another update on that line, the existing scoped override is advanced in place;
+overrides are never chained.
 
 ## Pull requests and merges
 
