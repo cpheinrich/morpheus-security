@@ -540,9 +540,15 @@ export function requiredChecksReady(rollup, requiredChecks) {
   for (const requiredCheck of requiredChecks) {
     const matches = (rollup ?? []).filter((check) => (check.name ?? check.context) === requiredCheck);
     if (matches.length === 0) return { ready: false, reason: `required check is missing: ${requiredCheck}` };
+    const successfulCheckIds = matches.filter((check) =>
+      check.status === "COMPLETED" && check.conclusion === "SUCCESS" && Number.isFinite(Number(check.id)))
+      .map((check) => Number(check.id));
+    const latestSuccessfulCheckId = successfulCheckIds.length ? Math.max(...successfulCheckIds) : null;
     const accepted = matches.every((check) => {
       if (check.status !== "COMPLETED") return check.state === "SUCCESS";
-      return ["SUCCESS", "CANCELLED", "SKIPPED", "NEUTRAL"].includes(check.conclusion);
+      if (check.conclusion === "SUCCESS") return true;
+      return ["CANCELLED", "SKIPPED", "NEUTRAL"].includes(check.conclusion) &&
+        latestSuccessfulCheckId != null && Number(check.id) < latestSuccessfulCheckId;
     });
     const hasSuccess = matches.some((check) =>
       check.status === "COMPLETED" ? check.conclusion === "SUCCESS" : check.state === "SUCCESS");
@@ -566,6 +572,7 @@ export function restCheckRollup(checkRuns, commitStatuses) {
   }
   return [
     ...(checkRuns ?? []).map((check) => ({
+      id: check.id,
       name: check.name,
       status: String(check.status ?? "").toUpperCase(),
       conclusion: check.conclusion == null ? null : String(check.conclusion).toUpperCase(),

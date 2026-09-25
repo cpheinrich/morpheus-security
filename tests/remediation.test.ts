@@ -213,6 +213,15 @@ describe("security remediation inputs", () => {
       .toEqual(expect.objectContaining({ ready: false }));
   });
 
+  it("does not ignore a cancellation newer than the matching success", () => {
+    const rollup = restCheckRollup([
+      { id: 10, name: "test", app: { id: 1 }, check_suite: { id: 100 }, status: "completed", conclusion: "success" },
+      { id: 11, name: "test", app: { id: 1 }, check_suite: { id: 200 }, status: "completed", conclusion: "cancelled" },
+    ], []);
+    expect(requiredChecksReady(rollup, ["test"]))
+      .toEqual(expect.objectContaining({ ready: false }));
+  });
+
   it("combines every paginated REST status page", () => {
     const readiness = restMergeReadiness(
       { mergeable: true, mergeable_state: "clean" },
