@@ -9,6 +9,7 @@ import {
   assertOfficialUvArtifacts,
   combineFindings,
   restCheckRollup,
+  restMergeReadiness,
   requiredChecksReady,
   staleCandidateAction,
   updateNpm,
@@ -190,9 +191,9 @@ describe("security remediation inputs", () => {
 
   it("normalizes the newest REST check and status results without Actions access", () => {
     const rollup = restCheckRollup([
-      { id: 1, name: "test", status: "completed", conclusion: "failure" },
-      { id: 2, name: "test", status: "completed", conclusion: "success" },
-      { id: 3, name: "build", status: "in_progress", conclusion: null },
+      { id: 1, name: "test", app: { id: 10 }, status: "completed", conclusion: "failure" },
+      { id: 2, name: "test", app: { id: 10 }, status: "completed", conclusion: "success" },
+      { id: 3, name: "build", app: { id: 10 }, status: "in_progress", conclusion: null },
     ], [
       { id: 4, context: "policy", state: "failure" },
       { id: 5, context: "policy", state: "success" },
@@ -201,6 +202,29 @@ describe("security remediation inputs", () => {
       .toEqual(expect.objectContaining({ ready: true }));
     expect(requiredChecksReady(rollup, ["build"]))
       .toEqual(expect.objectContaining({ ready: false }));
+  });
+
+  it("does not let a same-named check from another App erase a failure", () => {
+    const rollup = restCheckRollup([
+      { id: 10, name: "test", app: { id: 1 }, status: "completed", conclusion: "failure" },
+      { id: 11, name: "test", app: { id: 2 }, status: "completed", conclusion: "success" },
+    ], []);
+    expect(requiredChecksReady(rollup, ["test"]))
+      .toEqual(expect.objectContaining({ ready: false }));
+  });
+
+  it("combines every paginated REST status page", () => {
+    const readiness = restMergeReadiness(
+      { mergeable: true, mergeable_state: "clean" },
+      [{ check_runs: [] }],
+      [
+        [{ id: 1, context: "first", state: "success" }],
+        [{ id: 2, context: "later", state: "success" }],
+      ],
+    );
+    expect(readiness.mergeStateStatus).toBe("clean");
+    expect(requiredChecksReady(readiness.statusCheckRollup, ["later"]))
+      .toEqual(expect.objectContaining({ ready: true }));
   });
 
   it("trusts only a successful attestation owned by the current App and head", () => {
@@ -248,7 +272,7 @@ describe("security remediation inputs", () => {
     expect(remediation).not.toContain("statusCheckRollup,mergeStateStatus");
     expect(remediation).not.toContain("mergeStateStatus,statusCheckRollup");
     expect(remediation).toContain("/check-runs?per_page=100");
-    expect(remediation).toContain("/status?per_page=100");
+    expect(remediation).toContain("/statuses?per_page=100");
   });
 
   it("binds the public target workflow to live policy and split repository tokens", () => {

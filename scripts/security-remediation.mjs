@@ -557,8 +557,10 @@ export function staleCandidateAction(mergeStateStatus) {
 export function restCheckRollup(checkRuns, commitStatuses) {
   const latestChecks = new Map();
   for (const check of checkRuns ?? []) {
-    const current = latestChecks.get(check.name);
-    if (!current || Number(check.id ?? 0) > Number(current.id ?? 0)) latestChecks.set(check.name, check);
+    const app = check.app?.id ?? check.app?.slug ?? "unknown";
+    const key = `${app}\0${check.name}`;
+    const current = latestChecks.get(key);
+    if (!current || Number(check.id ?? 0) > Number(current.id ?? 0)) latestChecks.set(key, check);
   }
   const latestStatuses = new Map();
   for (const status of commitStatuses ?? []) {
@@ -578,18 +580,23 @@ export function restCheckRollup(checkRuns, commitStatuses) {
   ];
 }
 
-function mergeReadiness(repo, prNumber, headSha) {
-  const pull = gh(["api", `repos/${repo}/pulls/${prNumber}`]);
-  const checkPages = gh(["api", "--paginate", "--slurp",
-    `repos/${repo}/commits/${headSha}/check-runs?per_page=100`]);
-  const combinedStatus = gh(["api", `repos/${repo}/commits/${headSha}/status?per_page=100`]);
+export function restMergeReadiness(pull, checkPages, statusPages) {
   return {
     mergeStateStatus: pull?.mergeable == null ? "unknown" : pull.mergeable_state,
     statusCheckRollup: restCheckRollup(
       (checkPages ?? []).flatMap((page) => page.check_runs ?? []),
-      combinedStatus?.statuses ?? [],
+      (statusPages ?? []).flatMap((page) => page),
     ),
   };
+}
+
+function mergeReadiness(repo, prNumber, headSha) {
+  const pull = gh(["api", `repos/${repo}/pulls/${prNumber}`]);
+  const checkPages = gh(["api", "--paginate", "--slurp",
+    `repos/${repo}/commits/${headSha}/check-runs?per_page=100`]);
+  const statusPages = gh(["api", "--paginate", "--slurp",
+    `repos/${repo}/commits/${headSha}/statuses?per_page=100`]);
+  return restMergeReadiness(pull, checkPages, statusPages);
 }
 
 export function verifiedCandidateAttestation(checkRuns, botSlug, headSha, repo) {
