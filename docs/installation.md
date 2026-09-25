@@ -1,7 +1,8 @@
 # Installation
 
-Morpheus Security is a centrally operated, public-but-unlisted GitHub App. Its nightly workflow
-runs from this repository; installers do not receive or configure the App private key.
+Morpheus Security is a centrally operated, public-but-unlisted GitHub App. Its reviewed engine is
+public, while its nightly caller, logs, artifacts, and sole App private key live in a separate
+private operations repository. Installers do not receive or configure the private key.
 
 ## GitHub App permissions
 
@@ -56,7 +57,7 @@ security-fix PRs; keep Dependabot alerts enabled.
 
 ## Credential custody and self-hosting
 
-The maintainers keep the App private key only in the protected `security-bot` environment of this
+The maintainers keep the App private key only as an Actions secret in the private operations
 repository, with an offline recovery copy in a credential vault. GitHub stores only the public
 portion. The central workflow exchanges the key for short-lived, least-privilege tokens scoped to
 one target repository and its optional incident repository, then revokes its discovery tokens.
@@ -64,10 +65,12 @@ one target repository and its optional incident repository, then revokes its dis
 The private key grants authority across every installation. Install only if you trust the App's
 maintainers and reviewed workflow with the selected repositories. To retain that authority
 yourself, fork this repository, register a separate GitHub App with the permissions above, and
-store your own App ID and private key once in a protected `security-bot` environment as:
+store your own App ID and private key once in a private, protected operations repository as:
 
 - `MORPHEUS_SECURITY_APP_ID`
 - `MORPHEUS_SECURITY_PRIVATE_KEY`
 
 Never commit or distribute the private key. Require pull-request review and passing CI for changes
-to the orchestrator workflow and scripts. Rotate the key immediately if exposure is suspected.
+to the public engine and private caller. Use only scheduled or `repository_dispatch` triggers so
+secrets cannot be requested from an arbitrary branch. Rotate the key immediately if exposure is
+suspected.

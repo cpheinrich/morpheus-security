@@ -198,16 +198,25 @@ describe("security remediation inputs", () => {
     expect(staleCandidateAction("BLOCKED")).toBe("continue");
   });
 
-  it("refreshes live default-branch state after reconciliation and before scanning", () => {
+  it("binds the public target workflow to live policy and split repository tokens", () => {
     const workflow = readFileSync(".github/workflows/security-remediation.yml", "utf8");
     const reconcile = workflow.indexOf("name: Reconcile existing bot pull requests");
-    const refresh = workflow.indexOf("name: Refresh the trusted default branch before scanning");
+    const refresh = workflow.indexOf("name: Refresh and authenticate the live default branch");
+    const revalidate = workflow.indexOf("name: Revalidate the live opt-in policy");
     const scan = workflow.indexOf("name: Scan trusted main with OSV");
+    expect(workflow).toContain("workflow_call:");
+    expect(workflow).not.toContain("workflow_dispatch:");
+    expect(workflow).not.toContain("schedule:");
     expect(reconcile).toBeGreaterThan(-1);
-    expect(refresh).toBeGreaterThan(reconcile);
-    expect(scan).toBeGreaterThan(refresh);
+    expect(refresh).toBeLessThan(reconcile);
+    expect(revalidate).toBeGreaterThan(refresh);
+    expect(revalidate).toBeLessThan(reconcile);
+    expect(scan).toBeGreaterThan(reconcile);
     expect(workflow).toContain('test "$(git rev-parse HEAD)" = "$LIVE_SHA"');
-    expect(workflow).toContain("TARGET_REPOSITORY: ${{ matrix.target.repository }}");
-    expect(workflow).not.toContain("secrets.app_private_key");
+    expect(workflow).toContain("TARGET_REPOSITORY: ${{ inputs.target-repository }}");
+    expect(workflow).toContain("repositories: ${{ inputs.target-name }}");
+    expect(workflow).toContain("permission-issues: write");
+    expect(workflow).toContain("INCIDENT_GH_TOKEN: ${{ steps.incident-token.outputs.token }}");
+    expect(workflow).toContain("ref: ${{ inputs.security-sha }}");
   });
 });

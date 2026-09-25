@@ -21,7 +21,8 @@ independent review. Never commit a GitHub App private key. Commits created for C
 Co-authored-by: Codex <codex@cpheinrich.com>
 ```
 
-The public repository operates the public-but-unlisted App from one protected GitHub environment.
-Installed repositories never receive the master private key. Preserve central credential custody,
-per-target installation tokens, committed opt-in policy, and protected-main review as one trust
-boundary. Self-hosting operators register their own App and retain their own central private key.
+The public repository is reviewed source for the public-but-unlisted App. A separate private
+operations repository owns the nightly caller, master key, logs, and receipts. Installed
+repositories never receive the master key. Preserve central credential custody, reviewed allowlist,
+per-target tokens, a separate issues-only incident token, committed opt-in policy, and protected-main
+review as one trust boundary. Self-hosting operators register their own App and private caller.

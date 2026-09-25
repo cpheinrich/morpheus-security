@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 const API = "https://api.github.com";
 const CONFIG_PATH = ".github/morpheus-security.json";
 const APPROVED_PATH = "config/approved-repositories.json";
+const REPOSITORY = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
 
 function base64url(value) {
   return Buffer.from(value).toString("base64url");
@@ -39,35 +40,26 @@ async function request(fetchImpl, path, token, options = {}) {
   return response.json();
 }
 
-async function paginated(fetchImpl, path, token, field = null) {
-  const values = [];
-  for (let page = 1; ; page += 1) {
-    const separator = path.includes("?") ? "&" : "?";
-    const body = await request(fetchImpl, `${path}${separator}per_page=100&page=${page}`, token);
-    const entries = field ? body[field] : body;
-    if (!Array.isArray(entries)) throw new Error(`Unexpected paginated response for ${path}`);
-    values.push(...entries);
-    if (entries.length < 100) return values;
-  }
-}
-
-function validateConfig(config, repository) {
+function validateConfig(config, approved) {
   if (config?.version !== 1 || !Array.isArray(config.holds) ||
       !Array.isArray(config.requiredChecks) ||
       !config.requiredChecks.every((name) => typeof name === "string" && name.trim() === name && name.length > 0) ||
-      !(config.incidentRepository === null || typeof config.incidentRepository === "string")) {
-    throw new Error(`${repository} has an invalid ${CONFIG_PATH}`);
+      !(config.incidentRepository === null || typeof config.incidentRepository === "string") ||
+      config.incidentRepository !== approved.incidentRepository) {
+    throw new Error(`${approved.repository} has an invalid or unapproved ${CONFIG_PATH}`);
   }
 }
 
 export function approvedRepositories(path = APPROVED_PATH) {
-  const repositories = JSON.parse(readFileSync(path, "utf8"));
-  if (!Array.isArray(repositories) ||
-      !repositories.every((repository) => /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(repository)) ||
-      new Set(repositories).size !== repositories.length) {
-    throw new Error(`${path} must contain unique owner/name repository strings`);
+  const entries = JSON.parse(readFileSync(path, "utf8"));
+  if (!Array.isArray(entries) || entries.length === 0 || entries.some((entry) =>
+    !entry || !REPOSITORY.test(entry.repository ?? "") ||
+    !(entry.incidentRepository === null || REPOSITORY.test(entry.incidentRepository ?? "")) ||
+    (entry.incidentRepository && entry.incidentRepository.split("/")[0] !== entry.repository.split("/")[0])) ||
+    new Set(entries.map((entry) => entry.repository)).size !== entries.length) {
+    throw new Error(`${path} must contain unique repository and approved same-owner incidentRepository entries`);
   }
-  return repositories;
+  return entries;
 }
 
 export async function discoverTargets({
@@ -79,44 +71,63 @@ export async function discoverTargets({
   warn = () => {},
 } = {}) {
   const jwt = appJwt(appId, privateKey, now);
-  const approvedSet = new Set(approved);
-  const installations = await paginated(fetchImpl, "/app/installations", jwt);
   const targets = [];
-  for (const installation of installations) {
-    if (installation.suspended_at) continue;
-    const tokenBody = await request(fetchImpl, `/app/installations/${installation.id}/access_tokens`, jwt, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ permissions: { contents: "read" } }),
-    });
-    const token = tokenBody.token;
+  for (const entry of approved) {
+    let token = null;
     try {
-      const repositories = await paginated(fetchImpl, "/installation/repositories", token, "repositories");
-      for (const repository of repositories) {
-        if (!approvedSet.has(repository.full_name)) continue;
-        const configBody = await request(fetchImpl,
-          `/repos/${repository.full_name}/contents/${CONFIG_PATH}?ref=${encodeURIComponent(repository.default_branch)}`,
-          token, { allowNotFound: true });
-        if (!configBody) continue;
-        if (configBody.type !== "file" || configBody.encoding !== "base64") {
-          throw new Error(`${repository.full_name} returned an invalid ${CONFIG_PATH}`);
-        }
-        try {
-          const config = JSON.parse(Buffer.from(configBody.content, "base64").toString("utf8"));
-          validateConfig(config, repository.full_name);
-        } catch {
-          warn(`${repository.full_name} was skipped because ${CONFIG_PATH} is invalid`);
+      const installation = await request(fetchImpl, `/repos/${entry.repository}/installation`, jwt, {
+        allowNotFound: true,
+      });
+      if (!installation || installation.suspended_at) {
+        warn(`${entry.repository} was skipped because the App installation is unavailable`);
+        continue;
+      }
+      if (entry.incidentRepository) {
+        const incidentInstallation = await request(fetchImpl,
+          `/repos/${entry.incidentRepository}/installation`, jwt, { allowNotFound: true });
+        if (!incidentInstallation || incidentInstallation.id !== installation.id) {
+          warn(`${entry.repository} was skipped because its approved incident repository is not in the same installation`);
           continue;
         }
-        targets.push({
-          repository: repository.full_name,
-          owner: repository.owner.login,
-          name: repository.name,
-          defaultBranch: repository.default_branch,
-        });
       }
+      const [, name] = entry.repository.split("/");
+      const tokenBody = await request(fetchImpl, `/app/installations/${installation.id}/access_tokens`, jwt, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repositories: [name], permissions: { contents: "read" } }),
+      });
+      token = tokenBody.token;
+      const repository = await request(fetchImpl, `/repos/${entry.repository}`, token);
+      const configBody = await request(fetchImpl,
+        `/repos/${entry.repository}/contents/${CONFIG_PATH}?ref=${encodeURIComponent(repository.default_branch)}`,
+        token, { allowNotFound: true });
+      if (!configBody) continue;
+      if (configBody.type !== "file" || configBody.encoding !== "base64") {
+        throw new Error(`${entry.repository} returned an invalid ${CONFIG_PATH}`);
+      }
+      const config = JSON.parse(Buffer.from(configBody.content, "base64").toString("utf8"));
+      validateConfig(config, entry);
+      const [owner, repositoryName] = entry.repository.split("/");
+      const [incidentOwner = "", incidentName = ""] = entry.incidentRepository?.split("/") ?? [];
+      targets.push({
+        repository: entry.repository,
+        owner,
+        name: repositoryName,
+        defaultBranch: repository.default_branch,
+        incidentRepository: entry.incidentRepository ?? "",
+        incidentOwner,
+        incidentName,
+      });
+    } catch (error) {
+      warn(`${entry.repository} was skipped: ${String(error.message ?? error)}`);
     } finally {
-      await request(fetchImpl, "/installation/token", token, { method: "DELETE" });
+      if (token) {
+        try {
+          await request(fetchImpl, "/installation/token", token, { method: "DELETE" });
+        } catch {
+          warn(`${entry.repository} discovery token could not be revoked and will expire automatically`);
+        }
+      }
     }
   }
   return targets.sort((left, right) => left.repository.localeCompare(right.repository));

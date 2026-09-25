@@ -1,39 +1,49 @@
 #!/usr/bin/env node
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-export function tokenRepositories(config, targetRepository) {
-  const [owner, repository, extra] = targetRepository.split("/");
-  const ownerPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
-  const repositoryPattern = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}$/;
-  if (!ownerPattern.test(owner ?? "") || !repositoryPattern.test(repository ?? "") || extra) {
-    throw new Error("TARGET_REPOSITORY must be a safe GitHub owner/name");
+const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+const NAME = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}$/;
+
+function parseRepository(value, label) {
+  const [owner, name, extra] = String(value ?? "").split("/");
+  if (!OWNER.test(owner ?? "") || !NAME.test(name ?? "") || extra) {
+    throw new Error(`${label} must be a safe GitHub owner/name`);
   }
-  if (config?.version !== 1 || !Array.isArray(config.holds ?? []) ||
-      !Array.isArray(config.requiredChecks ?? [])) {
-    throw new Error("Security config must have version 1 and holds/requiredChecks arrays");
+  return { owner, name, repository: `${owner}/${name}` };
+}
+
+export function validateTargetScope(config, targetRepository, targetOwner, targetName, approvedIncident = "") {
+  const target = parseRepository(targetRepository, "TARGET_REPOSITORY");
+  if (target.owner !== targetOwner || target.name !== targetName) {
+    throw new Error("Target owner/name inputs do not match TARGET_REPOSITORY");
   }
-  const repositories = [repository];
-  if (config.incidentRepository) {
-    if (typeof config.incidentRepository !== "string") {
-      throw new Error("incidentRepository must be owner/name under the target repository owner");
+  if (config?.version !== 1 || !Array.isArray(config.holds) || !Array.isArray(config.requiredChecks) ||
+      !config.requiredChecks.every((name) => typeof name === "string" && name.trim() === name && name.length > 0)) {
+    throw new Error("Security config must explicitly define version 1 and valid holds/requiredChecks arrays");
+  }
+  const configuredIncident = config.incidentRepository ?? "";
+  if (configuredIncident !== approvedIncident) {
+    throw new Error("incidentRepository does not match the centrally approved mapping");
+  }
+  if (approvedIncident) {
+    const incident = parseRepository(approvedIncident, "APPROVED_INCIDENT_REPOSITORY");
+    if (incident.owner !== target.owner) {
+      throw new Error("incidentRepository must be under the target repository owner");
     }
-    const [incidentOwner, incidentRepository, incidentExtra] = config.incidentRepository.split("/");
-    if (!ownerPattern.test(incidentOwner ?? "") || !repositoryPattern.test(incidentRepository ?? "") ||
-        incidentExtra || incidentOwner !== owner) {
-      throw new Error("incidentRepository must be owner/name under the target repository owner");
-    }
-    repositories.push(incidentRepository);
   }
-  return [...new Set(repositories)];
+  return { target: target.repository, incidentRepository: approvedIncident || null };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const path = process.env.CONFIG_FILE ?? ".github/morpheus-security.json";
-  const config = existsSync(path)
-    ? JSON.parse(readFileSync(path, "utf8"))
-    : { version: 1, holds: [], incidentRepository: null };
-  const repositories = tokenRepositories(config, process.env.TARGET_REPOSITORY ?? "");
-  if (!process.env.GITHUB_OUTPUT) throw new Error("GITHUB_OUTPUT is required");
-  appendFileSync(process.env.GITHUB_OUTPUT, `repositories<<EOF\n${repositories.join("\n")}\nEOF\n`);
+  if (!existsSync(path)) throw new Error(`Required opt-in policy is missing: ${path}`);
+  const config = JSON.parse(readFileSync(path, "utf8"));
+  validateTargetScope(
+    config,
+    process.env.TARGET_REPOSITORY,
+    process.env.TARGET_OWNER,
+    process.env.TARGET_NAME,
+    process.env.APPROVED_INCIDENT_REPOSITORY ?? "",
+  );
 }

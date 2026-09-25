@@ -59,8 +59,8 @@ function packageRun(file, args, options = {}) {
   return run(file, args, { ...options, env: packageManagerEnvironment() });
 }
 
-function gh(args) {
-  const output = run("gh", args);
+function gh(args, token = process.env.GH_TOKEN) {
+  const output = run("gh", args, { env: { ...process.env, GH_TOKEN: token } });
   return output ? JSON.parse(output) : null;
 }
 
@@ -75,14 +75,15 @@ function summary(markdown) {
 
 function loadConfig() {
   const path = process.env.SECURITY_CONFIG ?? ".github/morpheus-security.json";
-  if (!existsSync(path)) return { version: 1, holds: [], requiredChecks: [], incidentRepository: null };
+  if (!existsSync(path)) throw new Error(`Required opt-in policy is missing: ${path}`);
   const config = JSON.parse(readFileSync(path, "utf8"));
-  if (config?.version !== 1 || !Array.isArray(config.holds ?? []) ||
-      !Array.isArray(config.requiredChecks ?? []) ||
-      !(config.requiredChecks ?? []).every((name) => typeof name === "string" && name.trim() === name && name.length > 0)) {
-    throw new Error("Security config must have version 1 and holds/requiredChecks arrays");
+  if (config?.version !== 1 || !Array.isArray(config.holds) ||
+      !Array.isArray(config.requiredChecks) ||
+      !config.requiredChecks.every((name) => typeof name === "string" && name.trim() === name && name.length > 0) ||
+      !(config.incidentRepository === null || typeof config.incidentRepository === "string")) {
+    throw new Error("Security config must explicitly define version 1 and valid holds/requiredChecks arrays");
   }
-  return { holds: [], requiredChecks: [], incidentRepository: null, ...config };
+  return config;
 }
 
 function dependabotFindings(repo) {
@@ -135,11 +136,11 @@ function slug(value) {
   return value.toLowerCase().replace(/^@/, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 45);
 }
 
-function ensureLabel(repo, name, color, description) {
+function ensureLabel(repo, name, color, description, token = process.env.GH_TOKEN) {
   try {
-    gh(["api", `repos/${repo}/labels/${encodeURIComponent(name)}`]);
+    gh(["api", `repos/${repo}/labels/${encodeURIComponent(name)}`], token);
   } catch {
-    run("gh", ["api", "--method", "POST", `repos/${repo}/labels`, "-f", `name=${name}`, "-f", `color=${color}`, "-f", `description=${description}`]);
+    gh(["api", "--method", "POST", `repos/${repo}/labels`, "-f", `name=${name}`, "-f", `color=${color}`, "-f", `description=${description}`], token);
   }
 }
 
@@ -149,7 +150,10 @@ export function incidentRepository(repo, config) {
     if (!config.incidentRepository) throw new Error("Public repositories require a private incidentRepository");
   }
   const target = config.incidentRepository ?? repo;
-  const targetVisibility = run("gh", ["api", `repos/${target}`, "--jq", ".visibility"]);
+  const incidentToken = target === repo ? process.env.GH_TOKEN : required("INCIDENT_GH_TOKEN");
+  const targetVisibility = run("gh", ["api", `repos/${target}`, "--jq", ".visibility"], {
+    env: { ...process.env, GH_TOKEN: incidentToken },
+  });
   if (targetVisibility !== "private") {
     throw new Error(`Malware incident repository must be private: ${target}`);
   }
@@ -158,22 +162,23 @@ export function incidentRepository(repo, config) {
 
 function upsertMalwareIncident(repo, finding, config) {
   const target = incidentRepository(repo, config);
-  for (const label of INCIDENT_LABELS) ensureLabel(target, ...label);
+  const incidentToken = target === repo ? process.env.GH_TOKEN : required("INCIDENT_GH_TOKEN");
+  for (const label of INCIDENT_LABELS) ensureLabel(target, ...label, incidentToken);
   const marker = `<!-- morpheus-malware-incident:${findingKey(finding)} -->`;
-  const pages = gh(["api", "--paginate", "--slurp", `repos/${target}/issues?state=all&labels=dependency-malware&per_page=100`]);
+  const pages = gh(["api", "--paginate", "--slurp", `repos/${target}/issues?state=all&labels=dependency-malware&per_page=100`], incidentToken);
   const existing = (pages ?? []).flatMap((page) => page).find((issue) => String(issue.body ?? "").includes(marker));
   const body = `${marker}\n\nMorpheus Security detected malicious package advisory **${finding.advisory}** for ` +
     `\`${finding.dependency}@${finding.version}\` in \`${repo}\` (\`${finding.sourcePath}\`).\n\n` +
     `Automated remediation is being attempted separately. This incident remains open until a human records whether the affected package was installed or executed, what credentials were exposed, and what rotation or containment was completed.\n\n` +
     `Advisory: https://osv.dev/vulnerability/${finding.advisory}`;
   if (existing) {
-    run("gh", ["api", "--method", "PATCH", `repos/${target}/issues/${existing.number}`, "-f", `body=${body}`]);
+    gh(["api", "--method", "PATCH", `repos/${target}/issues/${existing.number}`, "-f", `body=${body}`], incidentToken);
     return existing.html_url;
   }
   const created = gh(["api", "--method", "POST", `repos/${target}/issues`,
     "-f", `title=[Security incident] ${finding.advisory} in ${finding.dependency}`,
     "-f", `body=${body}`,
-    ...INCIDENT_LABELS.flatMap(([name]) => ["-f", `labels[]=${name}`])]);
+    ...INCIDENT_LABELS.flatMap(([name]) => ["-f", `labels[]=${name}`])], incidentToken);
   return created.html_url;
 }
 
@@ -633,7 +638,16 @@ function deliver() {
 
 function reconcile() {
   const repo = targetRepository();
+  const defaultBranch = required("DEFAULT_BRANCH");
   const config = loadConfig();
+  const checkedOutSha = run("git", ["rev-parse", "HEAD"]);
+  const initialLiveSha = run("gh", ["api", `repos/${repo}/commits/${defaultBranch}`, "--jq", ".sha"]);
+  if (checkedOutSha !== initialLiveSha) {
+    summary(`- Reconciliation stopped because ${defaultBranch} changed after checkout.`);
+    output("open_prs", "0");
+    output("merged", "false");
+    return;
+  }
   const open = openSecurityPulls(repo);
   let merged = false;
   for (const pr of open) {
@@ -669,11 +683,17 @@ function reconcile() {
       summary(`- ${pr.html_url}: waiting; ${readiness.reason}.`);
       continue;
     }
+    const liveSha = run("gh", ["api", `repos/${repo}/commits/${defaultBranch}`, "--jq", ".sha"]);
+    if (liveSha !== checkedOutSha) {
+      summary(`- ${pr.html_url}: not merged because ${defaultBranch} changed during reconciliation.`);
+      break;
+    }
     try {
       run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--match-head-commit", headSha,
         "--squash", "--delete-branch"]);
       merged = true;
       summary(`- ${pr.html_url}: merged after every explicit required check passed.`);
+      break;
     } catch (error) {
       summary(`- ${pr.html_url}: merge rejected by GitHub (${String(error.stderr ?? error.message).trim()})`);
     }

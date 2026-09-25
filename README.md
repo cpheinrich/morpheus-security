@@ -4,8 +4,8 @@
 
 # Morpheus Security
 
-Deterministic OSV and GitHub advisory remediation for GitHub repositories. A central nightly GitHub
-Action discovers repositories that installed the App and committed its policy file, opens one
+Deterministic OSV and GitHub advisory remediation for GitHub repositories. A nightly GitHub Action
+in a private operations repository discovers approved repositories that installed the App and committed its policy file, opens one
 dependency-only pull request at a time per lockfile, and merges only on a later run after the
 repository's explicitly named checks pass.
 
@@ -13,14 +13,15 @@ Morpheus Security uses no model, OpenAI API, local agent, or paid service.
 
 ## Trust model
 
-The public-but-unlisted `morpheus-security` GitHub App is operated by this repository's scheduled
-workflow. Installers grant the App access only to repositories they select and opt each repository
+The public-but-unlisted `morpheus-security` GitHub App uses this public repository as its reviewed
+source. Its schedule, sole private key, workflow logs, and scan receipts live in a separate private
+operations repository. Installers grant the App access only to repositories they select and opt each repository
 in by committing `.github/morpheus-security.json`. They never receive the App private key. The
-maintainers retain that key in one protected GitHub environment and can mint short-lived tokens for
+maintainers retain that key in one private repository and can mint short-lived tokens for
 every installation, as is normal for a centrally operated GitHub App.
 
 Operators who do not want to trust the maintainers with that authority can fork this repository,
-register their own GitHub App, and keep their key in their own central environment.
+register their own GitHub App, and keep their key in their own private operations repository.
 
 Read the [security and remediation policy](docs/policy.md), then follow the
 [installation runbook](docs/installation.md).
