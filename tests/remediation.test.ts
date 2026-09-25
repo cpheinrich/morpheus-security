@@ -147,6 +147,23 @@ describe("security remediation inputs", () => {
     }
   });
 
+  it("accepts an explicit official npm registry without credentials", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-official-"));
+    try {
+      writeFileSync(join(dir, "package.json"), `${JSON.stringify({
+        name: "official-npm-fixture", private: true, dependencies: { uuid: "9.0.1" },
+      })}\n`);
+      execFileSync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], {
+        cwd: dir,
+        stdio: "ignore",
+      });
+      writeFileSync(join(dir, ".npmrc"), "registry=https://registry.npmjs.org/\n");
+      expect(() => updateNpm({ ...osv, sourcePath: join(dir, "package-lock.json") })).not.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("merges only after every explicitly named check passes", () => {
     const rollup = [
       { name: "test", status: "COMPLETED", conclusion: "SUCCESS" },

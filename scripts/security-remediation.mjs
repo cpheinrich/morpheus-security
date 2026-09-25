@@ -199,9 +199,15 @@ function assertOfficialNpmConfiguration(root) {
   visit(root);
   for (const path of npmrcFiles) {
     const text = readFileSync(path, "utf8");
-    if (/^\s*(?:@[^:]+:)?registry\s*=/im.test(text) ||
-        /^\s*[^#]*(?:_auth|authToken|password|certfile|keyfile)\s*=/im.test(text)) {
+    if (/^\s*[^#;]*(?:_auth|authToken|password|certfile|keyfile)\s*=/im.test(text)) {
       throw new Error(`Refusing repository registry or credential configuration in ${relative(root, path)}`);
+    }
+    for (const line of text.split(/\r?\n/)) {
+      if (/^\s*[#;]/.test(line) || !line.trim()) continue;
+      const registry = /^\s*(?:@[^:\s]+:)?registry\s*=\s*(\S+)\s*$/i.exec(line);
+      if (registry && !/^https:\/\/registry\.npmjs\.org\/?$/i.test(registry[1])) {
+        throw new Error(`Refusing repository registry or credential configuration in ${relative(root, path)}`);
+      }
     }
   }
   const workspacePath = join(root, "pnpm-workspace.yaml");
