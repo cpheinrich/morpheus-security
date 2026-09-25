@@ -9,6 +9,7 @@ import {
   assertOfficialUvArtifacts,
   combineFindings,
   requiredChecksReady,
+  staleCandidateAction,
   updateNpm,
   updatePnpm,
   verifiedCandidateAttestation,
@@ -187,5 +188,13 @@ describe("security remediation inputs", () => {
     expect(verifiedCandidateAttestation([
       { ...check, output: { summary: JSON.stringify({ ...receipt, dependency: "other" }) }, app: { slug: "other-app" } },
     ], "example-security", headSha, "cpheinrich/example")).toBeNull();
+  });
+
+  it("recreates stale candidates instead of retrying an impossible strict merge", () => {
+    expect(staleCandidateAction("BEHIND")).toBe("recreate");
+    expect(staleCandidateAction("DIRTY")).toBe("recreate");
+    expect(staleCandidateAction("UNKNOWN")).toBe("wait");
+    expect(staleCandidateAction("CLEAN")).toBe("continue");
+    expect(staleCandidateAction("BLOCKED")).toBe("continue");
   });
 });

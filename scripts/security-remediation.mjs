@@ -531,6 +531,12 @@ export function requiredChecksReady(rollup, requiredChecks) {
   return { ready: true, reason: "all explicit required checks passed" };
 }
 
+export function staleCandidateAction(mergeStateStatus) {
+  if (mergeStateStatus === "BEHIND" || mergeStateStatus === "DIRTY") return "recreate";
+  if (mergeStateStatus === "UNKNOWN") return "wait";
+  return "continue";
+}
+
 export function verifiedCandidateAttestation(checkRuns, botSlug, headSha, repo) {
   const candidates = (checkRuns ?? []).filter((check) =>
     check.name === CANDIDATE_CHECK && check.head_sha === headSha && check.app?.slug === botSlug &&
@@ -591,7 +597,7 @@ function deliver() {
     summary(`## Security remediation dry run\n\nValidated ${finding.dependency}: scoped diff, official artifacts, and clean candidate rescan.`);
     return;
   }
-  const branch = `morpheus-security/${slug(finding.ecosystem)}-${slug(finding.dependency)}-${slug(finding.advisory)}`;
+  const branch = `morpheus-security/${slug(finding.ecosystem)}-${slug(finding.dependency)}-${slug(finding.advisory)}-${plan.beforeSha.slice(0, 8)}`;
   run("git", ["config", "user.name", botLogin]);
   run("git", ["config", "user.email", `${botLogin.replace(/\[bot\]$/, "")}[bot]@users.noreply.github.com`]);
   run("git", ["switch", "-c", branch]);
@@ -643,7 +649,17 @@ function reconcile() {
       summary(`- ${pr.html_url}: not merged because of the current project hold.`);
       continue;
     }
-    const detail = gh(["pr", "view", String(pr.number), "--repo", repo, "--json", "statusCheckRollup"]);
+    const detail = gh(["pr", "view", String(pr.number), "--repo", repo, "--json", "mergeStateStatus,statusCheckRollup"]);
+    const staleAction = staleCandidateAction(detail?.mergeStateStatus);
+    if (staleAction === "recreate") {
+      run("gh", ["pr", "close", String(pr.number), "--repo", repo, "--delete-branch"]);
+      summary(`- ${pr.html_url}: closed because its base is stale or conflicted; this run will recreate the candidate from current main and require fresh validation.`);
+      continue;
+    }
+    if (staleAction === "wait") {
+      summary(`- ${pr.html_url}: waiting because GitHub has not resolved its merge state.`);
+      continue;
+    }
     const readiness = requiredChecksReady(detail?.statusCheckRollup, config.requiredChecks);
     if (!readiness.ready) {
       summary(`- ${pr.html_url}: waiting; ${readiness.reason}.`);
