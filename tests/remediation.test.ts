@@ -8,6 +8,7 @@ import {
   assertOfficialPnpmArtifacts,
   assertOfficialUvArtifacts,
   combineFindings,
+  malwareIncidentBody,
   restCheckRollup,
   restMergeReadiness,
   requiredChecksReady,
@@ -25,6 +26,17 @@ const osv = {
 };
 
 describe("security remediation inputs", () => {
+  it("keeps public incident text non-sensitive and lists every affected manifest", () => {
+    const body = malwareIncidentBody("cpheinrich/public-repo", { ...osv, advisory: "MAL-2026-1" }, [
+      { ...osv, advisory: "MAL-2026-1", sourcePath: "apps/one/package-lock.json", version: "1.0.0" },
+      { ...osv, advisory: "MAL-2026-1", sourcePath: "apps/two/package-lock.json", version: "2.0.0" },
+    ]);
+    expect(body).toContain("apps/one/package-lock.json");
+    expect(body).toContain("apps/two/package-lock.json");
+    expect(body).toContain("Keep credentials, tokens, exposure details");
+    expect(body).not.toContain("what credentials were exposed");
+  });
+
   it("deduplicates GitHub alerts against OSV aliases", () => {
     const combined = combineFindings([structuredClone(osv)], [{
       ...structuredClone(osv), advisory: "GHSA-one", aliases: ["CVE-one", "GHSA-one"],

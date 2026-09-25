@@ -144,15 +144,28 @@ function ensureLabel(repo, name, color, description, token = process.env.GH_TOKE
   }
 }
 
-function upsertMalwareIncident(repo, finding) {
+export function malwareIncidentBody(repo, finding, findings) {
+  const related = findings.filter((candidate) => findingKey(candidate) === findingKey(finding));
+  const affected = [...new Set(related.map((candidate) =>
+    `- \`${candidate.sourcePath}\` (observed version: \`${candidate.version}\`)`))].sort();
+  const marker = `<!-- morpheus-malware-incident:${findingKey(finding)} -->`;
+  return `${marker}\n\nMorpheus Security detected malicious package advisory **${finding.advisory}** for ` +
+    `\`${finding.dependency}\` in \`${repo}\`.\n\nAffected manifests:\n${affected.join("\n")}\n\n` +
+    "Automated remediation is being attempted separately. Keep credentials, tokens, exposure " +
+    "details, and other private investigation material out of this issue. Record only safe status " +
+    "updates here.\n\n" +
+    "- [ ] Private installation/execution exposure assessment completed\n" +
+    "- [ ] Required credential rotation and containment completed\n" +
+    "- [ ] Remediation merged and the default branch rescanned clean\n\n" +
+    `Advisory: https://osv.dev/vulnerability/${finding.advisory}`;
+}
+
+function upsertMalwareIncident(repo, finding, findings) {
   for (const label of INCIDENT_LABELS) ensureLabel(repo, ...label);
   const marker = `<!-- morpheus-malware-incident:${findingKey(finding)} -->`;
   const pages = gh(["api", "--paginate", "--slurp", `repos/${repo}/issues?state=all&labels=dependency-malware&per_page=100`]);
   const existing = (pages ?? []).flatMap((page) => page).find((issue) => String(issue.body ?? "").includes(marker));
-  const body = `${marker}\n\nMorpheus Security detected malicious package advisory **${finding.advisory}** for ` +
-    `\`${finding.dependency}@${finding.version}\` in \`${repo}\` (\`${finding.sourcePath}\`).\n\n` +
-    `Automated remediation is being attempted separately. This incident remains open until a human records whether the affected package was installed or executed, what credentials were exposed, and what rotation or containment was completed.\n\n` +
-    `Advisory: https://osv.dev/vulnerability/${finding.advisory}`;
+  const body = malwareIncidentBody(repo, finding, findings);
   if (existing) {
     gh(["api", "--method", "PATCH", `repos/${repo}/issues/${existing.number}`, "-f", `body=${body}`]);
     return existing.html_url;
@@ -467,7 +480,7 @@ function prepare() {
   const open = openSecurityPulls(repo);
 
   for (const finding of findings.filter((candidate) => candidate.malicious)) {
-    finding.incidentUrl = upsertMalwareIncident(repo, finding);
+    finding.incidentUrl = upsertMalwareIncident(repo, finding, findings);
   }
 
   const openLockfiles = new Set(open.map((pr) => /Lockfile: `([^`]+)`/.exec(pr.body ?? "")?.[1]).filter(Boolean));
