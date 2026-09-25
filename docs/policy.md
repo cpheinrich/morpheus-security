@@ -30,6 +30,8 @@ their subprocess environment, and changed pnpm integrity checked against registr
 runs with builds disabled and accepts changed artifacts only from hashed PyPI releases.
 An explicit repository `.npmrc` is accepted only when its registry entries name
 `https://registry.npmjs.org/` and it contains no credential configuration.
+When a transitive npm or pnpm parent range cannot reach a fix, the generated override is scoped to
+the vulnerable installed version so parallel incompatible major lines are not collapsed.
 
 ## Pull requests and merges
 

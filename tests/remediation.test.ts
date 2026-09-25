@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -132,6 +132,103 @@ describe("security remediation inputs", () => {
       expect(manifest.dependencies.yaml).toBe("2.9.1");
       expect(readFileSync(lockfile, "utf8")).toContain("yaml@2.9.1");
       expect(() => assertOfficialPnpmArtifacts(lockfile, beforeLock)).not.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("preserves unrelated pnpm transitive major lines", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-pnpm-lines-"));
+    try {
+      mkdirSync(join(dir, "packages", "legacy"), { recursive: true });
+      mkdirSync(join(dir, "packages", "current"), { recursive: true });
+      writeFileSync(join(dir, "package.json"), `${JSON.stringify({
+        name: "pnpm-security-lines-fixture",
+        private: true,
+        packageManager: "pnpm@11.9.0",
+      }, null, 2)}\n`);
+      writeFileSync(join(dir, "pnpm-workspace.yaml"), [
+        "packages:",
+        "  - packages/*",
+        "overrides:",
+        "  brace-expansion@<2: 1.1.15",
+        "  brace-expansion@>=5: 5.0.6",
+        "",
+      ].join("\n"));
+      writeFileSync(join(dir, "packages", "legacy", "package.json"), `${JSON.stringify({
+        name: "legacy", private: true, dependencies: { minimatch: "3.1.5" },
+      })}\n`);
+      writeFileSync(join(dir, "packages", "current", "package.json"), `${JSON.stringify({
+        name: "current", private: true, dependencies: { minimatch: "10.2.5" },
+      })}\n`);
+      execFileSync("pnpm", ["install", "--lockfile-only", "--ignore-scripts"], { cwd: dir, stdio: "ignore" });
+      const lockfile = join(dir, "pnpm-lock.yaml");
+      expect(readFileSync(lockfile, "utf8")).toContain("brace-expansion@1.1.15");
+      expect(readFileSync(lockfile, "utf8")).toContain("brace-expansion@5.0.6");
+      writeFileSync(join(dir, "pnpm-workspace.yaml"), "packages:\n  - packages/*\n");
+
+      const result = updatePnpm({
+        ecosystem: "npm",
+        dependency: "brace-expansion",
+        version: "1.1.15",
+        advisory: "GHSA-fixture",
+        aliases: ["GHSA-fixture"],
+        fixedVersion: "1.1.16",
+        sourcePath: lockfile,
+        malicious: false,
+        withdrawn: false,
+      });
+
+      const updated = readFileSync(lockfile, "utf8");
+      const packages = updated.split("\npackages:\n")[1];
+      expect(result.strategy).toBe("pnpm-transitive-override");
+      expect(packages).not.toContain("brace-expansion@1.1.15");
+      expect(packages).toContain("brace-expansion@1.1.16");
+      expect(packages).toContain("brace-expansion@5.0.6");
+      expect(readFileSync(join(dir, "pnpm-workspace.yaml"), "utf8"))
+        .toContain("brace-expansion@1.1.15: 1.1.16");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("accepts an npm transitive update above the first patched version", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-compatible-"));
+    try {
+      const manifestPath = join(dir, "package.json");
+      const manifest = {
+        name: "npm-security-compatible-fixture",
+        private: true,
+        dependencies: { mkdirp: "0.5.6" },
+      };
+      writeFileSync(manifestPath, `${JSON.stringify({
+        ...manifest,
+        overrides: { minimist: "1.2.6" },
+      }, null, 2)}\n`);
+      execFileSync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], {
+        cwd: dir,
+        stdio: "ignore",
+      });
+      const lockfile = join(dir, "package-lock.json");
+      expect(readFileSync(lockfile, "utf8")).toContain('"version": "1.2.6"');
+      writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+      const result = updateNpm({
+        ecosystem: "npm",
+        dependency: "minimist",
+        version: "1.2.6",
+        advisory: "GHSA-fixture",
+        aliases: ["GHSA-fixture"],
+        fixedVersion: "1.2.7",
+        sourcePath: lockfile,
+        malicious: false,
+        withdrawn: false,
+      });
+
+      const updated = JSON.parse(readFileSync(lockfile, "utf8"));
+      expect(result.strategy).toBe("transitive-compatible");
+      expect(updated.packages["node_modules/minimist"].version).toBe("1.2.8");
+      expect(JSON.parse(readFileSync(manifestPath, "utf8"))).not.toHaveProperty("overrides");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
