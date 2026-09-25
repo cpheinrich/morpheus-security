@@ -540,17 +540,67 @@ export function requiredChecksReady(rollup, requiredChecks) {
   for (const requiredCheck of requiredChecks) {
     const matches = (rollup ?? []).filter((check) => (check.name ?? check.context) === requiredCheck);
     if (matches.length === 0) return { ready: false, reason: `required check is missing: ${requiredCheck}` };
-    const successful = matches.every((check) =>
+    const successfulCheckIds = matches.filter((check) =>
+      check.status === "COMPLETED" && check.conclusion === "SUCCESS" && Number.isFinite(Number(check.id)))
+      .map((check) => Number(check.id));
+    const latestSuccessfulCheckId = successfulCheckIds.length ? Math.max(...successfulCheckIds) : null;
+    const accepted = matches.every((check) => {
+      if (check.status !== "COMPLETED") return check.state === "SUCCESS";
+      if (check.conclusion === "SUCCESS") return true;
+      return ["CANCELLED", "SKIPPED", "NEUTRAL"].includes(check.conclusion) &&
+        latestSuccessfulCheckId != null && Number(check.id) < latestSuccessfulCheckId;
+    });
+    const hasSuccess = matches.some((check) =>
       check.status === "COMPLETED" ? check.conclusion === "SUCCESS" : check.state === "SUCCESS");
-    if (!successful) return { ready: false, reason: `required check has not passed: ${requiredCheck}` };
+    if (!accepted || !hasSuccess) return { ready: false, reason: `required check has not passed: ${requiredCheck}` };
   }
   return { ready: true, reason: "all explicit required checks passed" };
 }
 
 export function staleCandidateAction(mergeStateStatus) {
-  if (mergeStateStatus === "BEHIND" || mergeStateStatus === "DIRTY") return "recreate";
-  if (mergeStateStatus === "UNKNOWN") return "wait";
+  const state = String(mergeStateStatus ?? "unknown").toUpperCase();
+  if (state === "BEHIND" || state === "DIRTY") return "recreate";
+  if (state === "UNKNOWN") return "wait";
   return "continue";
+}
+
+export function restCheckRollup(checkRuns, commitStatuses) {
+  const latestStatuses = new Map();
+  for (const status of commitStatuses ?? []) {
+    const current = latestStatuses.get(status.context);
+    if (!current || Number(status.id ?? 0) > Number(current.id ?? 0)) latestStatuses.set(status.context, status);
+  }
+  return [
+    ...(checkRuns ?? []).map((check) => ({
+      id: check.id,
+      name: check.name,
+      status: String(check.status ?? "").toUpperCase(),
+      conclusion: check.conclusion == null ? null : String(check.conclusion).toUpperCase(),
+    })),
+    ...[...latestStatuses.values()].map((status) => ({
+      context: status.context,
+      state: String(status.state ?? "").toUpperCase(),
+    })),
+  ];
+}
+
+export function restMergeReadiness(pull, checkPages, statusPages) {
+  return {
+    mergeStateStatus: pull?.mergeable == null ? "unknown" : pull.mergeable_state,
+    statusCheckRollup: restCheckRollup(
+      (checkPages ?? []).flatMap((page) => page.check_runs ?? []),
+      (statusPages ?? []).flatMap((page) => page),
+    ),
+  };
+}
+
+function mergeReadiness(repo, prNumber, headSha) {
+  const pull = gh(["api", `repos/${repo}/pulls/${prNumber}`]);
+  const checkPages = gh(["api", "--paginate", "--slurp",
+    `repos/${repo}/commits/${headSha}/check-runs?per_page=100`]);
+  const statusPages = gh(["api", "--paginate", "--slurp",
+    `repos/${repo}/commits/${headSha}/statuses?per_page=100`]);
+  return restMergeReadiness(pull, checkPages, statusPages);
 }
 
 export function verifiedCandidateAttestation(checkRuns, botSlug, headSha, repo) {
@@ -674,7 +724,7 @@ function reconcile() {
       summary(`- ${pr.html_url}: not merged because of the current project hold.`);
       continue;
     }
-    const detail = gh(["pr", "view", String(pr.number), "--repo", repo, "--json", "mergeStateStatus,statusCheckRollup"]);
+    const detail = mergeReadiness(repo, pr.number, headSha);
     const staleAction = staleCandidateAction(detail?.mergeStateStatus);
     if (staleAction === "recreate") {
       run("gh", ["pr", "close", String(pr.number), "--repo", repo, "--delete-branch"]);

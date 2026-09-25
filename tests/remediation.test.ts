@@ -8,6 +8,8 @@ import {
   assertOfficialPnpmArtifacts,
   assertOfficialUvArtifacts,
   combineFindings,
+  restCheckRollup,
+  restMergeReadiness,
   requiredChecksReady,
   staleCandidateAction,
   updateNpm,
@@ -187,6 +189,53 @@ describe("security remediation inputs", () => {
     ], ["test"])).toEqual(expect.objectContaining({ ready: false }));
   });
 
+  it("normalizes REST checks and the newest legacy status without Actions access", () => {
+    const rollup = restCheckRollup([
+      { id: 1, name: "test", app: { id: 10 }, status: "completed", conclusion: "cancelled" },
+      { id: 2, name: "test", app: { id: 10 }, status: "completed", conclusion: "success" },
+      { id: 3, name: "build", app: { id: 10 }, status: "in_progress", conclusion: null },
+    ], [
+      { id: 4, context: "policy", state: "failure" },
+      { id: 5, context: "policy", state: "success" },
+    ]);
+    expect(requiredChecksReady(rollup, ["test", "policy"]))
+      .toEqual(expect.objectContaining({ ready: true }));
+    expect(requiredChecksReady(rollup, ["build"]))
+      .toEqual(expect.objectContaining({ ready: false }));
+  });
+
+  it("does not let a same-named check from another App or suite erase a failure", () => {
+    const rollup = restCheckRollup([
+      { id: 10, name: "test", app: { id: 1 }, check_suite: { id: 100 }, status: "completed", conclusion: "failure" },
+      { id: 11, name: "test", app: { id: 1 }, check_suite: { id: 200 }, status: "completed", conclusion: "success" },
+    ], []);
+    expect(requiredChecksReady(rollup, ["test"]))
+      .toEqual(expect.objectContaining({ ready: false }));
+  });
+
+  it("does not ignore a cancellation newer than the matching success", () => {
+    const rollup = restCheckRollup([
+      { id: 10, name: "test", app: { id: 1 }, check_suite: { id: 100 }, status: "completed", conclusion: "success" },
+      { id: 11, name: "test", app: { id: 1 }, check_suite: { id: 200 }, status: "completed", conclusion: "cancelled" },
+    ], []);
+    expect(requiredChecksReady(rollup, ["test"]))
+      .toEqual(expect.objectContaining({ ready: false }));
+  });
+
+  it("combines every paginated REST status page", () => {
+    const readiness = restMergeReadiness(
+      { mergeable: true, mergeable_state: "clean" },
+      [{ check_runs: [] }],
+      [
+        [{ id: 1, context: "first", state: "success" }],
+        [{ id: 2, context: "later", state: "success" }],
+      ],
+    );
+    expect(readiness.mergeStateStatus).toBe("clean");
+    expect(requiredChecksReady(readiness.statusCheckRollup, ["later"]))
+      .toEqual(expect.objectContaining({ ready: true }));
+  });
+
   it("trusts only a successful attestation owned by the current App and head", () => {
     const headSha = "a".repeat(40);
     const receipt = {
@@ -223,6 +272,16 @@ describe("security remediation inputs", () => {
     expect(staleCandidateAction("UNKNOWN")).toBe("wait");
     expect(staleCandidateAction("CLEAN")).toBe("continue");
     expect(staleCandidateAction("BLOCKED")).toBe("continue");
+    expect(staleCandidateAction("behind")).toBe("recreate");
+    expect(staleCandidateAction(null)).toBe("wait");
+  });
+
+  it("does not require the Actions-only GraphQL check-rollup field", () => {
+    const remediation = readFileSync("scripts/security-remediation.mjs", "utf8");
+    expect(remediation).not.toContain("statusCheckRollup,mergeStateStatus");
+    expect(remediation).not.toContain("mergeStateStatus,statusCheckRollup");
+    expect(remediation).toContain("/check-runs?per_page=100");
+    expect(remediation).toContain("/statuses?per_page=100");
   });
 
   it("binds the public target workflow to live policy and split repository tokens", () => {
