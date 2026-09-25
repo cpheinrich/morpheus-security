@@ -117,6 +117,18 @@ jobs:
           BOT_LOGIN: ${{ steps.app-token.outputs.app-slug }}[bot]
         run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/security-remediation.mjs" reconcile
 
+      - name: Refresh the trusted default branch before scanning
+        if: steps.reconcile.outputs.merged != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          gh auth setup-git
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git checkout --detach "origin/$DEFAULT_BRANCH"
+          LIVE_SHA="$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
+          test "$(git rev-parse HEAD)" = "$LIVE_SHA"
+
       - name: Scan trusted main with OSV
         if: steps.reconcile.outputs.merged != 'true'
         id: scan-before

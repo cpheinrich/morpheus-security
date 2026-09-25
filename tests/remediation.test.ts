@@ -9,6 +9,7 @@ import {
   assertOfficialUvArtifacts,
   combineFindings,
   requiredChecksReady,
+  staleCandidateAction,
   updateNpm,
   updatePnpm,
   verifiedCandidateAttestation,
@@ -187,5 +188,24 @@ describe("security remediation inputs", () => {
     expect(verifiedCandidateAttestation([
       { ...check, output: { summary: JSON.stringify({ ...receipt, dependency: "other" }) }, app: { slug: "other-app" } },
     ], "example-security", headSha, "cpheinrich/example")).toBeNull();
+  });
+
+  it("recreates stale candidates instead of retrying an impossible strict merge", () => {
+    expect(staleCandidateAction("BEHIND")).toBe("recreate");
+    expect(staleCandidateAction("DIRTY")).toBe("recreate");
+    expect(staleCandidateAction("UNKNOWN")).toBe("wait");
+    expect(staleCandidateAction("CLEAN")).toBe("continue");
+    expect(staleCandidateAction("BLOCKED")).toBe("continue");
+  });
+
+  it("refreshes live default-branch state after reconciliation and before scanning", () => {
+    const workflow = readFileSync(".github/workflows/security-remediation.yml", "utf8");
+    const reconcile = workflow.indexOf("name: Reconcile existing bot pull requests");
+    const refresh = workflow.indexOf("name: Refresh the trusted default branch before scanning");
+    const scan = workflow.indexOf("name: Scan trusted main with OSV");
+    expect(reconcile).toBeGreaterThan(-1);
+    expect(refresh).toBeGreaterThan(reconcile);
+    expect(scan).toBeGreaterThan(refresh);
+    expect(workflow).toContain('test "$(git rev-parse HEAD)" = "$LIVE_SHA"');
   });
 });

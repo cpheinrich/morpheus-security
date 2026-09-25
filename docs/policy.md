@@ -30,6 +30,12 @@ requires every explicitly configured `requiredChecks` entry to have passed, and 
 the merge to that head. An empty check list disables automatic merging. Branch protection and
 review rules remain additional authority. Human-authored PRs never receive the bot waiver.
 
+If the default branch advances and strict protection makes a validated candidate stale, the next
+run closes that bot PR and recreates it from current default-branch state under a new branch. The
+replacement must repeat registry validation, OSV rescan, App attestation, and every configured
+check; stale evidence is never carried forward. The runner refreshes and verifies the live default
+branch immediately after reconciliation and before the replacement scan.
+
 Project holds live in `.github/morpheus-security.json` and name the dependency, optional advisory,
 and reason. A hold leaves the PR open and prevents duplicates until policy changes.
 
