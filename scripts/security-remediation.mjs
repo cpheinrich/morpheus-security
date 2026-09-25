@@ -220,13 +220,12 @@ function registryArgs(dependency) {
   return ["--registry=https://registry.npmjs.org/", ...(scope ? [`--${scope}:registry=https://registry.npmjs.org/`] : [])];
 }
 
-function installedNpmVersion(lockfile, dependency) {
+function installedNpmVersions(lockfile, dependency) {
   const lock = JSON.parse(readFileSync(lockfile, "utf8"));
   const suffix = `/node_modules/${dependency}`;
   const matches = Object.entries(lock.packages ?? {}).filter(([path]) =>
     path === `node_modules/${dependency}` || path.endsWith(suffix));
-  const versions = [...new Set(matches.map(([, entry]) => entry.version).filter(Boolean))];
-  return versions.length === 1 ? versions[0] : null;
+  return [...new Set(matches.map(([, entry]) => entry.version).filter(Boolean))];
 }
 
 export function updateNpm(finding) {
@@ -258,13 +257,17 @@ export function updateNpm(finding) {
   }
 
   packageRun("npm", ["update", finding.dependency, "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
-  const updated = installedNpmVersion(finding.sourcePath, finding.dependency);
-  if (updated && updated !== finding.version) return { strategy: "transitive-compatible", manifestPath: null };
+  const updated = installedNpmVersions(finding.sourcePath, finding.dependency);
+  if (updated.includes(finding.fixedVersion) && !updated.includes(finding.version)) {
+    return { strategy: "transitive-compatible", manifestPath: null };
+  }
 
   // The parent range cannot reach the fix. An exact npm override is smaller
-  // than an unrelated parent major bump; CI still has final authority.
+  // than an unrelated parent major bump. Scope it to the vulnerable installed
+  // version so parallel, API-incompatible major lines remain untouched.
   const refreshed = JSON.parse(readFileSync(manifestPath, "utf8"));
-  refreshed.overrides = { ...(refreshed.overrides ?? {}), [finding.dependency]: finding.fixedVersion };
+  const selector = `${finding.dependency}@${finding.version}`;
+  refreshed.overrides = { ...(refreshed.overrides ?? {}), [selector]: finding.fixedVersion };
   writeFileSync(manifestPath, `${JSON.stringify(refreshed, null, 2)}\n`);
   packageRun("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
   return { strategy: "transitive-override", manifestPath: relative(process.cwd(), manifestPath) };
@@ -295,27 +298,27 @@ function pnpmDirectManifests(lockfile, dependency) {
   });
 }
 
-function installedPnpmVersion(lockfile, dependency) {
+function installedPnpmVersions(lockfile, dependency) {
   const prefix = `${dependency}@`;
-  const versions = [...new Set(Object.keys(pnpmLock(lockfile)?.packages ?? {})
+  return [...new Set(Object.keys(pnpmLock(lockfile)?.packages ?? {})
     .filter((key) => key.startsWith(prefix))
     .map((key) => key.slice(prefix.length).split("(")[0])
     .filter(Boolean))];
-  return versions.length === 1 ? versions[0] : null;
 }
 
-function writePnpmOverride(root, dependency, fixedVersion) {
+function writePnpmOverride(root, dependency, installedVersion, fixedVersion) {
+  const selector = `${dependency}@${installedVersion}`;
   const workspacePath = join(root, "pnpm-workspace.yaml");
   if (existsSync(workspacePath)) {
     const document = parseDocument(readFileSync(workspacePath, "utf8"));
-    document.setIn(["overrides", dependency], fixedVersion);
+    document.setIn(["overrides", selector], fixedVersion);
     writeFileSync(workspacePath, String(document));
     return relative(process.cwd(), workspacePath);
   }
   const manifestPath = join(root, "package.json");
   if (!existsSync(manifestPath)) throw new Error(`No package.json beside ${join(root, "pnpm-lock.yaml")}`);
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-  manifest.pnpm = { ...(manifest.pnpm ?? {}), overrides: { ...(manifest.pnpm?.overrides ?? {}), [dependency]: fixedVersion } };
+  manifest.pnpm = { ...(manifest.pnpm ?? {}), overrides: { ...(manifest.pnpm?.overrides ?? {}), [selector]: fixedVersion } };
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   return relative(process.cwd(), manifestPath);
 }
@@ -350,10 +353,12 @@ export function updatePnpm(finding) {
   }
 
   packageRun("pnpm", ["update", `${finding.dependency}@${finding.fixedVersion}`, "--recursive", "--lockfile-only", "--ignore-scripts", ...registryArgs(finding.dependency)], { cwd: root });
-  const updated = installedPnpmVersion(finding.sourcePath, finding.dependency);
-  if (updated && updated !== finding.version) return { strategy: "pnpm-transitive-compatible", manifestPath: null, beforeLock };
+  const updated = installedPnpmVersions(finding.sourcePath, finding.dependency);
+  if (updated.includes(finding.fixedVersion) && !updated.includes(finding.version)) {
+    return { strategy: "pnpm-transitive-compatible", manifestPath: null, beforeLock };
+  }
 
-  const manifestPath = writePnpmOverride(root, finding.dependency, finding.fixedVersion);
+  const manifestPath = writePnpmOverride(root, finding.dependency, finding.version, finding.fixedVersion);
   packageRun("pnpm", ["install", "--lockfile-only", "--ignore-scripts", ...registryArgs(finding.dependency)], { cwd: root });
   return { strategy: "pnpm-transitive-override", manifestPath, beforeLock };
 }
