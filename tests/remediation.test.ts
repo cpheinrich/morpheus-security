@@ -197,4 +197,15 @@ describe("security remediation inputs", () => {
     expect(staleCandidateAction("CLEAN")).toBe("continue");
     expect(staleCandidateAction("BLOCKED")).toBe("continue");
   });
+
+  it("refreshes live default-branch state after reconciliation and before scanning", () => {
+    const workflow = readFileSync(".github/workflows/security-remediation.yml", "utf8");
+    const reconcile = workflow.indexOf("name: Reconcile existing bot pull requests");
+    const refresh = workflow.indexOf("name: Refresh the trusted default branch before scanning");
+    const scan = workflow.indexOf("name: Scan trusted main with OSV");
+    expect(reconcile).toBeGreaterThan(-1);
+    expect(refresh).toBeGreaterThan(reconcile);
+    expect(scan).toBeGreaterThan(refresh);
+    expect(workflow).toContain('test "$(git rev-parse HEAD)" = "$LIVE_SHA"');
+  });
 });
