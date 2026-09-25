@@ -192,6 +192,48 @@ describe("security remediation inputs", () => {
     }
   }, 30_000);
 
+  it("accepts an npm transitive update above the first patched version", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-compatible-"));
+    try {
+      const manifestPath = join(dir, "package.json");
+      const manifest = {
+        name: "npm-security-compatible-fixture",
+        private: true,
+        dependencies: { mkdirp: "0.5.6" },
+      };
+      writeFileSync(manifestPath, `${JSON.stringify({
+        ...manifest,
+        overrides: { minimist: "1.2.6" },
+      }, null, 2)}\n`);
+      execFileSync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], {
+        cwd: dir,
+        stdio: "ignore",
+      });
+      const lockfile = join(dir, "package-lock.json");
+      expect(readFileSync(lockfile, "utf8")).toContain('"version": "1.2.6"');
+      writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+      const result = updateNpm({
+        ecosystem: "npm",
+        dependency: "minimist",
+        version: "1.2.6",
+        advisory: "GHSA-fixture",
+        aliases: ["GHSA-fixture"],
+        fixedVersion: "1.2.7",
+        sourcePath: lockfile,
+        malicious: false,
+        withdrawn: false,
+      });
+
+      const updated = JSON.parse(readFileSync(lockfile, "utf8"));
+      expect(result.strategy).toBe("transitive-compatible");
+      expect(updated.packages["node_modules/minimist"].version).toBe("1.2.8");
+      expect(JSON.parse(readFileSync(manifestPath, "utf8"))).not.toHaveProperty("overrides");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("rejects repository registry overrides and non-registry direct specs", () => {
     const pnpmDir = mkdtempSync(join(tmpdir(), "morpheus-security-pnpm-config-"));
     const npmDir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-spec-"));

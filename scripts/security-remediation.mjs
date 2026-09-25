@@ -228,6 +228,11 @@ function installedNpmVersions(lockfile, dependency) {
   return [...new Set(matches.map(([, entry]) => entry.version).filter(Boolean))];
 }
 
+function installedNpmVersion(lockfile, dependency) {
+  const versions = installedNpmVersions(lockfile, dependency);
+  return versions.length === 1 ? versions[0] : null;
+}
+
 export function updateNpm(finding) {
   const root = packageRoot(finding.sourcePath);
   assertOfficialNpmConfiguration(root);
@@ -258,7 +263,7 @@ export function updateNpm(finding) {
 
   packageRun("npm", ["update", finding.dependency, "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
   const updated = installedNpmVersions(finding.sourcePath, finding.dependency);
-  if (updated.includes(finding.fixedVersion) && !updated.includes(finding.version)) {
+  if (updated.length > 0 && !updated.includes(finding.version)) {
     return { strategy: "transitive-compatible", manifestPath: null };
   }
 
@@ -354,7 +359,7 @@ export function updatePnpm(finding) {
 
   packageRun("pnpm", ["update", `${finding.dependency}@${finding.fixedVersion}`, "--recursive", "--lockfile-only", "--ignore-scripts", ...registryArgs(finding.dependency)], { cwd: root });
   const updated = installedPnpmVersions(finding.sourcePath, finding.dependency);
-  if (updated.includes(finding.fixedVersion) && !updated.includes(finding.version)) {
+  if (updated.length > 0 && !updated.includes(finding.version)) {
     return { strategy: "pnpm-transitive-compatible", manifestPath: null, beforeLock };
   }
 
