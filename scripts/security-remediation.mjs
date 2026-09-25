@@ -1,0 +1,516 @@
+#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { parse, parseDocument } from "yaml";
+import {
+  findingKey,
+  findingsFromOsvJson,
+  isSecurityDependencyOnly,
+  SECURITY_MARKER,
+} from "../dist/policy.js";
+
+const INCIDENT_LABELS = [
+  ["security-incident", "b60205", "Security incident record"],
+  ["dependency-malware", "8b0000", "Malicious dependency advisory"],
+  ["automated", "1f883d", "Created by automation"],
+  ["needs-exposure-review", "d4c5f9", "Human exposure assessment required"],
+];
+
+function required(name) {
+  const value = process.env[name];
+  if (!value) throw new Error(`${name} is required`);
+  return value;
+}
+
+function run(file, args, options = {}) {
+  return execFileSync(file, args, {
+    encoding: "utf8",
+    maxBuffer: 30 * 1024 * 1024,
+    stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
+    ...options,
+  }).trim();
+}
+
+function gh(args) {
+  const output = run("gh", args);
+  return output ? JSON.parse(output) : null;
+}
+
+function output(name, value) {
+  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value}\n`);
+}
+
+function summary(markdown) {
+  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${markdown.trim()}\n`);
+  else process.stdout.write(`${markdown.trim()}\n`);
+}
+
+function loadConfig() {
+  const path = process.env.SECURITY_CONFIG ?? ".github/morpheus-security.json";
+  if (!existsSync(path)) return { version: 1, holds: [], incidentRepository: null };
+  const config = JSON.parse(readFileSync(path, "utf8"));
+  if (config?.version !== 1 || !Array.isArray(config.holds ?? [])) {
+    throw new Error("Security config must have version 1 and an optional holds array");
+  }
+  return { holds: [], incidentRepository: null, ...config };
+}
+
+function dependabotFindings(repo) {
+  const pages = gh(["api", "--paginate", "--slurp", `repos/${repo}/dependabot/alerts?state=open&per_page=100`]);
+  return (pages ?? []).flatMap((page) => page).filter((alert) => !alert.security_advisory?.withdrawn_at).map((alert) => ({
+    ecosystem: alert.dependency.package.ecosystem,
+    dependency: alert.dependency.package.name,
+    version: "unknown",
+    advisory: alert.security_advisory.ghsa_id,
+    aliases: (alert.security_advisory.identifiers ?? []).map((identifier) => identifier.value).sort(),
+    fixedVersion: alert.security_vulnerability.first_patched_version?.identifier ?? null,
+    sourcePath: alert.dependency.manifest_path,
+    malicious: String(alert.security_advisory.ghsa_id).startsWith("MAL-"),
+    withdrawn: false,
+  }));
+}
+
+export function combineFindings(osv, github) {
+  const combined = [...osv];
+  for (const candidate of github) {
+    const match = combined.find((finding) =>
+      finding.ecosystem.toLowerCase() === candidate.ecosystem.toLowerCase() &&
+      finding.dependency === candidate.dependency &&
+      finding.aliases.some((alias) => candidate.aliases.includes(alias)));
+    if (match) {
+      match.aliases = [...new Set([...match.aliases, ...candidate.aliases])].sort();
+      match.fixedVersion ??= candidate.fixedVersion;
+    } else {
+      combined.push(candidate);
+    }
+  }
+  return combined.sort((a, b) =>
+    Number(b.malicious) - Number(a.malicious) ||
+    a.sourcePath.localeCompare(b.sourcePath) || a.dependency.localeCompare(b.dependency));
+}
+
+function openSecurityPulls(repo) {
+  const pages = gh(["api", "--paginate", "--slurp", `repos/${repo}/pulls?state=open&per_page=100`]);
+  return (pages ?? []).flatMap((page) => page).filter((pr) =>
+    pr.user?.login === "morpheus-security[bot]" && String(pr.body ?? "").includes(SECURITY_MARKER));
+}
+
+function held(finding, config) {
+  return config.holds.find((hold) => hold.dependency === finding.dependency &&
+    (!hold.advisory || finding.aliases.includes(hold.advisory)));
+}
+
+function slug(value) {
+  return value.toLowerCase().replace(/^@/, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 45);
+}
+
+function ensureLabel(repo, name, color, description) {
+  try {
+    gh(["api", `repos/${repo}/labels/${encodeURIComponent(name)}`]);
+  } catch {
+    run("gh", ["api", "--method", "POST", `repos/${repo}/labels`, "-f", `name=${name}`, "-f", `color=${color}`, "-f", `description=${description}`]);
+  }
+}
+
+export function incidentRepository(repo, config) {
+  const visibility = run("gh", ["api", `repos/${repo}`, "--jq", ".visibility"]);
+  if (visibility === "public") {
+    if (!config.incidentRepository) throw new Error("Public repositories require a private incidentRepository");
+  }
+  const target = config.incidentRepository ?? repo;
+  const targetVisibility = run("gh", ["api", `repos/${target}`, "--jq", ".visibility"]);
+  if (targetVisibility !== "private") {
+    throw new Error(`Malware incident repository must be private: ${target}`);
+  }
+  return target;
+}
+
+function upsertMalwareIncident(repo, finding, config) {
+  const target = incidentRepository(repo, config);
+  for (const label of INCIDENT_LABELS) ensureLabel(target, ...label);
+  const marker = `<!-- morpheus-malware-incident:${findingKey(finding)} -->`;
+  const pages = gh(["api", "--paginate", "--slurp", `repos/${target}/issues?state=all&labels=dependency-malware&per_page=100`]);
+  const existing = (pages ?? []).flatMap((page) => page).find((issue) => String(issue.body ?? "").includes(marker));
+  const body = `${marker}\n\nMorpheus Security detected malicious package advisory **${finding.advisory}** for ` +
+    `\`${finding.dependency}@${finding.version}\` in \`${repo}\` (\`${finding.sourcePath}\`).\n\n` +
+    `Automated remediation is being attempted separately. This incident remains open until a human records whether the affected package was installed or executed, what credentials were exposed, and what rotation or containment was completed.\n\n` +
+    `Advisory: https://osv.dev/vulnerability/${finding.advisory}`;
+  if (existing) {
+    run("gh", ["api", "--method", "PATCH", `repos/${target}/issues/${existing.number}`, "-f", `body=${body}`]);
+    return existing.html_url;
+  }
+  const created = gh(["api", "--method", "POST", `repos/${target}/issues`,
+    "-f", `title=[Security incident] ${finding.advisory} in ${finding.dependency}`,
+    "-f", `body=${body}`,
+    ...INCIDENT_LABELS.flatMap(([name]) => ["-f", `labels[]=${name}`])]);
+  return created.html_url;
+}
+
+function packageRoot(lockfile) {
+  return dirname(resolve(lockfile));
+}
+
+function installedNpmVersion(lockfile, dependency) {
+  const lock = JSON.parse(readFileSync(lockfile, "utf8"));
+  const suffix = `/node_modules/${dependency}`;
+  const matches = Object.entries(lock.packages ?? {}).filter(([path]) =>
+    path === `node_modules/${dependency}` || path.endsWith(suffix));
+  const versions = [...new Set(matches.map(([, entry]) => entry.version).filter(Boolean))];
+  return versions.length === 1 ? versions[0] : null;
+}
+
+function updateNpm(finding) {
+  const root = packageRoot(finding.sourcePath);
+  const manifestPath = join(root, "package.json");
+  if (!existsSync(manifestPath)) throw new Error(`No package.json beside ${finding.sourcePath}`);
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const groups = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
+  const direct = groups.find((group) => Object.hasOwn(manifest[group] ?? {}, finding.dependency));
+  if (finding.malicious && !finding.fixedVersion) {
+    if (!direct) throw new Error(`Malicious transitive ${finding.dependency} has no fixed version; incident opened but automatic removal is unsafe`);
+    delete manifest[direct][finding.dependency];
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    run("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: root });
+    return { strategy: "remove-malicious-direct", manifestPath: relative(process.cwd(), manifestPath) };
+  }
+  if (!finding.fixedVersion) throw new Error(`${finding.advisory} has no fixed version`);
+  if (direct) {
+    const current = manifest[direct][finding.dependency];
+    const prefix = typeof current === "string" && /^[~^]/.test(current) ? current[0] : "";
+    manifest[direct][finding.dependency] = `${prefix}${finding.fixedVersion}`;
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    run("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: root });
+    return { strategy: "direct", manifestPath: relative(process.cwd(), manifestPath) };
+  }
+
+  run("npm", ["update", finding.dependency, "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: root });
+  const updated = installedNpmVersion(finding.sourcePath, finding.dependency);
+  if (updated && updated !== finding.version) return { strategy: "transitive-compatible", manifestPath: null };
+
+  // The parent range cannot reach the fix. An exact npm override is smaller
+  // than an unrelated parent major bump; CI still has final authority.
+  const refreshed = JSON.parse(readFileSync(manifestPath, "utf8"));
+  refreshed.overrides = { ...(refreshed.overrides ?? {}), [finding.dependency]: finding.fixedVersion };
+  writeFileSync(manifestPath, `${JSON.stringify(refreshed, null, 2)}\n`);
+  run("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: root });
+  return { strategy: "transitive-override", manifestPath: relative(process.cwd(), manifestPath) };
+}
+
+function updateUv(finding) {
+  if (!finding.fixedVersion) throw new Error(`${finding.advisory} has no fixed version`);
+  const root = packageRoot(finding.sourcePath);
+  const beforeLock = readFileSync(finding.sourcePath, "utf8");
+  run("uv", ["lock", "--upgrade-package", `${finding.dependency}>=${finding.fixedVersion}`], { cwd: root });
+  return { strategy: "uv-lock", manifestPath: null, beforeLock };
+}
+
+function pnpmLock(lockfile) {
+  return parse(readFileSync(lockfile, "utf8"));
+}
+
+function pnpmDirectManifests(lockfile, dependency) {
+  const root = packageRoot(lockfile);
+  const importers = Object.keys(pnpmLock(lockfile)?.importers ?? { ".": {} });
+  const groups = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
+  return importers.flatMap((importer) => {
+    const manifestPath = join(root, importer === "." ? "package.json" : `${importer}/package.json`);
+    if (!existsSync(manifestPath)) return [];
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const group = groups.find((name) => Object.hasOwn(manifest[name] ?? {}, dependency));
+    return group ? [{ manifestPath, manifest, group }] : [];
+  });
+}
+
+function installedPnpmVersion(lockfile, dependency) {
+  const prefix = `${dependency}@`;
+  const versions = [...new Set(Object.keys(pnpmLock(lockfile)?.packages ?? {})
+    .filter((key) => key.startsWith(prefix))
+    .map((key) => key.slice(prefix.length).split("(")[0])
+    .filter(Boolean))];
+  return versions.length === 1 ? versions[0] : null;
+}
+
+function writePnpmOverride(root, dependency, fixedVersion) {
+  const workspacePath = join(root, "pnpm-workspace.yaml");
+  if (existsSync(workspacePath)) {
+    const document = parseDocument(readFileSync(workspacePath, "utf8"));
+    document.setIn(["overrides", dependency], fixedVersion);
+    writeFileSync(workspacePath, String(document));
+    return relative(process.cwd(), workspacePath);
+  }
+  const manifestPath = join(root, "package.json");
+  if (!existsSync(manifestPath)) throw new Error(`No package.json beside ${join(root, "pnpm-lock.yaml")}`);
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.pnpm = { ...(manifest.pnpm ?? {}), overrides: { ...(manifest.pnpm?.overrides ?? {}), [dependency]: fixedVersion } };
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  return relative(process.cwd(), manifestPath);
+}
+
+export function updatePnpm(finding) {
+  const root = packageRoot(finding.sourcePath);
+  const beforeLock = readFileSync(finding.sourcePath, "utf8");
+  const direct = pnpmDirectManifests(finding.sourcePath, finding.dependency);
+  if (finding.malicious && !finding.fixedVersion) {
+    if (direct.length === 0) throw new Error(`Malicious transitive ${finding.dependency} has no fixed version; incident opened but automatic removal is unsafe`);
+    for (const entry of direct) {
+      delete entry.manifest[entry.group][finding.dependency];
+      writeFileSync(entry.manifestPath, `${JSON.stringify(entry.manifest, null, 2)}\n`);
+    }
+    run("pnpm", ["install", "--lockfile-only", "--ignore-scripts"], { cwd: root });
+    return { strategy: "remove-malicious-direct", manifestPath: direct.map((entry) => relative(process.cwd(), entry.manifestPath)).join(","), beforeLock };
+  }
+  if (!finding.fixedVersion) throw new Error(`${finding.advisory} has no fixed version`);
+  if (direct.length > 0) {
+    for (const entry of direct) {
+      const current = entry.manifest[entry.group][finding.dependency];
+      if (typeof current !== "string" || !/^[~^]?\d/.test(current)) {
+        throw new Error(`Refusing unsupported pnpm direct specifier for ${finding.dependency}: ${String(current)}`);
+      }
+      const prefix = /^[~^]/.test(current) ? current[0] : "";
+      entry.manifest[entry.group][finding.dependency] = `${prefix}${finding.fixedVersion}`;
+      writeFileSync(entry.manifestPath, `${JSON.stringify(entry.manifest, null, 2)}\n`);
+    }
+    run("pnpm", ["install", "--lockfile-only", "--ignore-scripts"], { cwd: root });
+    return { strategy: "pnpm-direct", manifestPath: direct.map((entry) => relative(process.cwd(), entry.manifestPath)).join(","), beforeLock };
+  }
+
+  run("pnpm", ["update", `${finding.dependency}@${finding.fixedVersion}`, "--recursive", "--lockfile-only", "--ignore-scripts"], { cwd: root });
+  const updated = installedPnpmVersion(finding.sourcePath, finding.dependency);
+  if (updated && updated !== finding.version) return { strategy: "pnpm-transitive-compatible", manifestPath: null, beforeLock };
+
+  const manifestPath = writePnpmOverride(root, finding.dependency, finding.fixedVersion);
+  run("pnpm", ["install", "--lockfile-only", "--ignore-scripts"], { cwd: root });
+  return { strategy: "pnpm-transitive-override", manifestPath, beforeLock };
+}
+
+function applyUpdate(finding) {
+  const base = basename(finding.sourcePath);
+  if (base === "package-lock.json") return updateNpm(finding);
+  if (base === "pnpm-lock.yaml") return updatePnpm(finding);
+  if (base === "uv.lock") return updateUv(finding);
+  throw new Error(`No remediation adapter for ${base}; OSV detection still covers it`);
+}
+
+export function assertOfficialNpmArtifacts(lockfile, beforeText) {
+  const lock = JSON.parse(readFileSync(lockfile, "utf8"));
+  const before = JSON.parse(beforeText);
+  for (const [path, entry] of Object.entries(lock.packages ?? {})) {
+    if (!path.includes("node_modules/")) continue;
+    const previous = before.packages?.[path];
+    if (previous && previous.resolved === entry.resolved && previous.integrity === entry.integrity &&
+        previous?.link === entry.link) continue;
+    if (!entry.resolved) {
+      throw new Error(`Refusing changed npm artifact without a registry URL: ${path}`);
+    }
+    if (!String(entry.resolved).startsWith("https://registry.npmjs.org/")) {
+      throw new Error(`Refusing non-registry npm artifact at ${path}: ${entry.resolved}`);
+    }
+    if (!entry.integrity || !/^sha(?:256|384|512)-/.test(entry.integrity)) {
+      throw new Error(`Refusing npm artifact without a recognized integrity hash: ${path}`);
+    }
+  }
+}
+
+export function assertOfficialPnpmArtifacts(lockfile, beforeText) {
+  const before = parse(beforeText)?.packages ?? {};
+  const after = pnpmLock(lockfile)?.packages ?? {};
+  for (const [key, entry] of Object.entries(after)) {
+    if (JSON.stringify(before[key]) === JSON.stringify(entry)) continue;
+    const resolution = entry?.resolution;
+    if (!resolution || typeof resolution !== "object") {
+      throw new Error(`Refusing changed pnpm artifact without resolution metadata: ${key}`);
+    }
+    if (resolution.tarball) {
+      const url = new URL(resolution.tarball);
+      if (url.protocol !== "https:" || url.hostname !== "registry.npmjs.org") {
+        throw new Error(`Refusing non-registry pnpm artifact at ${key}: ${resolution.tarball}`);
+      }
+    }
+    if (typeof resolution.integrity !== "string" || !/^sha(?:256|384|512)-/.test(resolution.integrity)) {
+      throw new Error(`Refusing pnpm artifact without a recognized integrity hash: ${key}`);
+    }
+  }
+}
+
+function uvPackages(lockText) {
+  return lockText.split(/^\[\[package\]\]\s*$/m).slice(1).map((block) => {
+    const name = /^name = "([^"]+)"$/m.exec(block)?.[1];
+    const version = /^version = "([^"]+)"$/m.exec(block)?.[1] ?? "";
+    const source = /^source = (.+)$/m.exec(block)?.[1] ?? "workspace";
+    if (!name) throw new Error("uv.lock package is missing a name");
+    return { name, version, source, block };
+  });
+}
+
+export function assertOfficialUvArtifacts(lockfile, beforeText) {
+  const before = uvPackages(beforeText);
+  const after = uvPackages(readFileSync(lockfile, "utf8"));
+  for (const entry of after) {
+    const previous = before.find((candidate) => candidate.name === entry.name &&
+      candidate.version === entry.version && candidate.source === entry.source);
+    if (previous?.block === entry.block) continue;
+    if (entry.source !== '{ registry = "https://pypi.org/simple" }') {
+      if (previous) continue; // Existing workspace/path identity; only dependency edges changed.
+      throw new Error(`Refusing changed uv artifact from a non-PyPI source: ${entry.name}`);
+    }
+    const artifacts = [...entry.block.matchAll(/\{\s*url = "([^"]+)"([^}]*)\}/g)];
+    const urlFields = [...entry.block.matchAll(/url = "[^"]+"/g)];
+    if (artifacts.length === 0 || artifacts.length !== urlFields.length) {
+      throw new Error(`Refusing changed PyPI package without complete artifact metadata: ${entry.name}`);
+    }
+    for (const artifact of artifacts) {
+      const url = new URL(artifact[1]);
+      if (url.protocol !== "https:" || !["files.pythonhosted.org", "pypi.org"].includes(url.hostname)) {
+        throw new Error(`Refusing changed uv artifact from a non-PyPI host: ${entry.name}`);
+      }
+      if (!/hash = "sha256:[a-f0-9]{64}"/.test(artifact[2])) {
+        throw new Error(`Refusing changed PyPI artifact without a sha256 hash: ${entry.name}`);
+      }
+    }
+  }
+}
+
+function prepare() {
+  const repo = required("GITHUB_REPOSITORY");
+  const scanFile = required("SCAN_FILE");
+  const planFile = required("PLAN_FILE");
+  const config = loadConfig();
+  const osv = findingsFromOsvJson(JSON.parse(readFileSync(scanFile, "utf8")));
+  const findings = combineFindings(osv, dependabotFindings(repo));
+  for (const finding of findings) {
+    if (finding.version === "unknown" && basename(finding.sourcePath) === "package-lock.json") {
+      finding.version = installedNpmVersion(finding.sourcePath, finding.dependency) ?? "unknown";
+    }
+  }
+  const open = openSecurityPulls(repo);
+
+  for (const finding of findings.filter((candidate) => candidate.malicious)) {
+    finding.incidentUrl = upsertMalwareIncident(repo, finding, config);
+  }
+
+  const openLockfiles = new Set(open.map((pr) => /Lockfile: `([^`]+)`/.exec(pr.body ?? "")?.[1]).filter(Boolean));
+  const candidates = findings.filter((finding) => !held(finding, config) &&
+    !open.some((pr) => String(pr.body ?? "").includes(`Dependency: \`${finding.dependency}\``)) &&
+    !openLockfiles.has(finding.sourcePath));
+  const finding = candidates[0];
+  if (!finding) {
+    writeFileSync(planFile, JSON.stringify({ status: findings.length ? "waiting" : "clean", findings, open: open.map((pr) => pr.html_url) }, null, 2));
+    output("changed", "false");
+    summary(findings.length ? `## Security remediation\n\nNo new PR: ${open.length} bot PR(s) already cover the available lockfiles, or project holds apply.` : "## Security remediation\n\nOSV and GitHub advisory inputs are clean.");
+    return;
+  }
+
+  const beforeLock = ["package-lock.json", "pnpm-lock.yaml"].includes(basename(finding.sourcePath))
+    ? readFileSync(finding.sourcePath, "utf8") : null;
+  const update = applyUpdate(finding);
+  const changedFiles = run("git", ["diff", "--name-only"]).split("\n").filter(Boolean);
+  if (!isSecurityDependencyOnly(changedFiles)) throw new Error(`Updater changed a disallowed path: ${changedFiles.join(", ")}`);
+  if (!changedFiles.includes(finding.sourcePath)) throw new Error(`Updater did not change ${finding.sourcePath}`);
+  if (beforeLock && basename(finding.sourcePath) === "package-lock.json") {
+    assertOfficialNpmArtifacts(finding.sourcePath, beforeLock);
+  }
+  if (update.beforeLock && basename(finding.sourcePath) === "pnpm-lock.yaml") {
+    assertOfficialPnpmArtifacts(finding.sourcePath, update.beforeLock);
+    delete update.beforeLock;
+  }
+  if (update.beforeLock) {
+    assertOfficialUvArtifacts(finding.sourcePath, update.beforeLock);
+    delete update.beforeLock;
+  }
+  const plan = { status: "prepared", finding, update, changedFiles, beforeSha: run("git", ["rev-parse", "HEAD"]) };
+  mkdirSync(dirname(planFile), { recursive: true });
+  writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
+  output("changed", "true");
+  output("dependency", slug(finding.dependency));
+  output("advisory", slug(finding.advisory));
+}
+
+function ensureSecurityLabels(repo) {
+  for (const label of [
+    ["security", "b60205", "Security remediation"],
+    ["dependencies", "0366d6", "Dependency changes"],
+    ["automated-security", "1f883d", "Created by Morpheus Security"],
+  ]) ensureLabel(repo, ...label);
+}
+
+function deliver() {
+  const repo = required("GITHUB_REPOSITORY");
+  const plan = JSON.parse(readFileSync(required("PLAN_FILE"), "utf8"));
+  const after = findingsFromOsvJson(JSON.parse(readFileSync(required("AFTER_SCAN_FILE"), "utf8")));
+  const finding = plan.finding;
+  const remains = after.some((candidate) => candidate.dependency === finding.dependency &&
+    candidate.aliases.some((alias) => finding.aliases.includes(alias)));
+  if (remains) throw new Error(`${finding.advisory} remains after the candidate update`);
+
+  const changedFiles = run("git", ["diff", "--name-only"]).split("\n").filter(Boolean);
+  if (JSON.stringify(changedFiles.sort()) !== JSON.stringify([...plan.changedFiles].sort()) ||
+      !isSecurityDependencyOnly(changedFiles)) {
+    throw new Error("Candidate diff changed between preparation and delivery");
+  }
+  if (process.env.DRY_RUN === "true") {
+    summary(`## Security remediation dry run\n\nValidated ${finding.dependency}: scoped diff, official artifacts, and clean candidate rescan.`);
+    return;
+  }
+  const branch = `morpheus-security/${slug(finding.ecosystem)}-${slug(finding.dependency)}-${slug(finding.advisory)}`;
+  run("git", ["config", "user.name", "morpheus-security[bot]"]);
+  run("git", ["config", "user.email", "morpheus-security[bot]@users.noreply.github.com"]);
+  run("git", ["switch", "-c", branch]);
+  run("git", ["add", "--", ...changedFiles]);
+  run("git", ["commit", "-m", `fix(deps): remediate ${finding.dependency} ${finding.advisory}`,
+    "-m", "Co-authored-by: Codex <codex@cpheinrich.com>"]);
+  run("git", ["push", "--set-upstream", "origin", branch]);
+  ensureSecurityLabels(repo);
+  const incident = finding.incidentUrl ? `\nRelated incident: ${finding.incidentUrl}` : "";
+  const body = `${SECURITY_MARKER}\n\n## Summary\n\n` +
+    `Dependency: \`${finding.dependency}\`\n\nLockfile: \`${finding.sourcePath}\`\n\n` +
+    `Advisories: ${finding.aliases.map((alias) => `\`${alias}\``).join(", ")}\n\n` +
+    `- Remediate ${finding.advisory} (${finding.aliases.join(", ")}).\n` +
+    `- Update \`${finding.version}\` to the smallest available fixed line, \`${finding.fixedVersion ?? "removed"}\`, using \`${plan.update.strategy}\`.\n` +
+    `- OSV rescanned the candidate and no longer reports this package/advisory pair.\n` +
+    `- Registry URLs and lockfile integrity hashes passed the deterministic supply-chain gate.${incident}\n\n` +
+    `## Test plan\n\nRequired repository checks and deployment previews must pass before GitHub auto-merge.\n\n` +
+    `## Open questions\n\nNone.\n`;
+  const url = run("gh", ["pr", "create", "--repo", repo, "--base", "main", "--head", branch,
+    "--title", `fix(deps): remediate ${finding.dependency} security advisory`, "--body", body,
+    "--label", "security", "--label", "dependencies", "--label", "automated-security"]);
+  run("gh", ["pr", "merge", url, "--repo", repo, "--auto", "--squash", "--delete-branch"]);
+  output("pull_request", url);
+  summary(`## Security remediation\n\nOpened ${url} for ${finding.dependency} and enabled auto-merge behind repository checks.`);
+}
+
+function reconcile() {
+  const repo = required("GITHUB_REPOSITORY");
+  const config = loadConfig();
+  const open = openSecurityPulls(repo);
+  for (const pr of open) {
+    const dependency = /Dependency: `([^`]+)`/.exec(pr.body ?? "")?.[1];
+    const aliases = /Advisories: ([^\n]+)/.exec(pr.body ?? "")?.[1]
+      ?.split(",").map((value) => /`([^`]+)`/.exec(value)?.[1]).filter(Boolean) ?? [];
+    if (!dependency || aliases.length === 0) {
+      run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--disable-auto"]);
+      summary(`- ${pr.html_url}: auto-merge disabled because its policy metadata is incomplete.`);
+      continue;
+    }
+    if (held({ dependency, aliases }, config)) {
+      run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--disable-auto"]);
+      summary(`- ${pr.html_url}: auto-merge disabled by the current project hold.`);
+      continue;
+    }
+    try {
+      run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--auto", "--squash", "--delete-branch"]);
+    } catch (error) {
+      summary(`- ${pr.html_url}: auto-merge not advanced (${String(error.stderr ?? error.message).trim()})`);
+    }
+  }
+  output("open_prs", String(open.length));
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const command = process.argv[2];
+  if (command === "prepare") prepare();
+  else if (command === "deliver") deliver();
+  else if (command === "reconcile") reconcile();
+  else throw new Error("Usage: security-remediation.mjs prepare|deliver|reconcile");
+}

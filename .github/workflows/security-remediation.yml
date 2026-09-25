@@ -1,0 +1,172 @@
+name: Security remediation
+
+# Reusable, deterministic remediation. The caller owns its nightly trigger and
+# App secrets; Morpheus Security owns scanning, scope validation, and PR delivery.
+on:
+  workflow_call:
+    inputs:
+      config-file:
+        type: string
+        default: .github/morpheus-security.json
+      security-sha:
+        description: Exact 40-character Morpheus Security commit used for reviewed tooling
+        type: string
+        required: true
+    secrets:
+      app_id:
+        required: true
+      app_private_key:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: morpheus-security-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Mint a target-repository bootstrap token
+        id: bootstrap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ secrets.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      - name: Check out target main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.bootstrap-token.outputs.token }}
+
+      - name: Check out Morpheus Security tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: cpheinrich/morpheus-security
+          ref: ${{ inputs.security-sha }}
+          path: .morpheus-security-tooling
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Require an immutable tooling revision
+        env:
+          SECURITY_SHA: ${{ inputs.security-sha }}
+        run: |
+          if ! printf '%s' "$SECURITY_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "security-sha must be an exact 40-character commit" >&2
+            exit 1
+          fi
+          test "$(git -C .morpheus-security-tooling rev-parse HEAD)" = "$SECURITY_SHA"
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          package_json_file: .morpheus-security-tooling/package.json
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Resolve the installation-token repository scope
+        id: token-scope
+        env:
+          CONFIG_FILE: ${{ inputs.config-file }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+        run: node .morpheus-security-tooling/scripts/token-scope.mjs
+
+      - name: Mint the least-privilege work token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ secrets.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.token-scope.outputs.repositories }}
+          permission-actions: read
+          permission-checks: read
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-statuses: read
+          permission-vulnerability-alerts: read
+
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
+
+      - name: Install and compile trusted tooling
+        working-directory: .morpheus-security-tooling
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Isolate tooling from the project scan and diff
+        run: |
+          mv .morpheus-security-tooling "$RUNNER_TEMP/morpheus-security-tooling"
+          mkdir -p .morpheus-security
+
+      - name: Reconcile existing bot pull requests
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SECURITY_CONFIG: ${{ inputs.config-file }}
+        run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/security-remediation.mjs" reconcile
+
+      - name: Scan trusted main with OSV
+        id: scan-before
+        continue-on-error: true
+        uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+        with:
+          scan-args: |-
+            --format=json
+            --output=.morpheus-security/before.json
+            --recursive
+            ./
+
+      - name: Require a scanner result
+        run: test -s .morpheus-security/before.json
+
+      - name: Prepare one non-conflicting dependency update
+        id: prepare
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SCAN_FILE: .morpheus-security/before.json
+          PLAN_FILE: .morpheus-security/plan.json
+          SECURITY_CONFIG: ${{ inputs.config-file }}
+        run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/security-remediation.mjs" prepare
+
+      - name: Rescan candidate with OSV
+        if: steps.prepare.outputs.changed == 'true'
+        id: scan-after
+        continue-on-error: true
+        uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+        with:
+          scan-args: |-
+            --format=json
+            --output=.morpheus-security/after.json
+            --recursive
+            ./
+
+      - name: Deliver candidate pull request
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PLAN_FILE: .morpheus-security/plan.json
+          AFTER_SCAN_FILE: .morpheus-security/after.json
+        run: node "$RUNNER_TEMP/morpheus-security-tooling/scripts/security-remediation.mjs" deliver
+
+      - name: Upload the run receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: morpheus-security-receipt
+          path: |
+            .morpheus-security/before.json
+            .morpheus-security/after.json
+            .morpheus-security/plan.json
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 30
