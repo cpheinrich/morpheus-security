@@ -13,7 +13,7 @@ function parseRepository(value, label) {
   return { owner, name, repository: `${owner}/${name}` };
 }
 
-export function validateTargetScope(config, targetRepository, targetOwner, targetName, approvedIncident = "") {
+export function validateTargetScope(config, targetRepository, targetOwner, targetName) {
   const target = parseRepository(targetRepository, "TARGET_REPOSITORY");
   if (target.owner !== targetOwner || target.name !== targetName) {
     throw new Error("Target owner/name inputs do not match TARGET_REPOSITORY");
@@ -22,17 +22,10 @@ export function validateTargetScope(config, targetRepository, targetOwner, targe
       !config.requiredChecks.every((name) => typeof name === "string" && name.trim() === name && name.length > 0)) {
     throw new Error("Security config must explicitly define version 1 and valid holds/requiredChecks arrays");
   }
-  const configuredIncident = config.incidentRepository ?? "";
-  if (configuredIncident !== approvedIncident) {
-    throw new Error("incidentRepository does not match the centrally approved mapping");
+  if (config.incidentRepository != null) {
+    throw new Error("incidentRepository routing is unsupported; incidents are filed in the target repository");
   }
-  if (approvedIncident) {
-    const incident = parseRepository(approvedIncident, "APPROVED_INCIDENT_REPOSITORY");
-    if (incident.owner !== target.owner) {
-      throw new Error("incidentRepository must be under the target repository owner");
-    }
-  }
-  return { target: target.repository, incidentRepository: approvedIncident || null };
+  return { target: target.repository };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
@@ -44,6 +37,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.env.TARGET_REPOSITORY,
     process.env.TARGET_OWNER,
     process.env.TARGET_NAME,
-    process.env.APPROVED_INCIDENT_REPOSITORY ?? "",
   );
 }
