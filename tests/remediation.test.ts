@@ -134,6 +134,12 @@ describe("security remediation inputs", () => {
       writeFileSync(join(pnpmDir, ".npmrc"), "registry=https://evil.example/\n");
       expect(() => updatePnpm({ ...osv, dependency: "yaml", fixedVersion: "2.9.1", sourcePath: join(pnpmDir, "pnpm-lock.yaml") }))
         .toThrow("registry or credential configuration");
+      writeFileSync(join(pnpmDir, ".npmrc"), "registry=https://evil.example/ # trailing comment\n");
+      expect(() => updatePnpm({ ...osv, dependency: "yaml", fixedVersion: "2.9.1", sourcePath: join(pnpmDir, "pnpm-lock.yaml") }))
+        .toThrow("registry or credential configuration");
+      writeFileSync(join(pnpmDir, ".npmrc"), "@unsafe:registry=https://evil.example/ ; trailing comment\n");
+      expect(() => updatePnpm({ ...osv, dependency: "yaml", fixedVersion: "2.9.1", sourcePath: join(pnpmDir, "pnpm-lock.yaml") }))
+        .toThrow("registry or credential configuration");
 
       writeFileSync(join(npmDir, "package.json"), `${JSON.stringify({
         name: "unsafe-npm-fixture", private: true, dependencies: { uuid: "git+https://example.com/uuid.git" },
@@ -146,6 +152,27 @@ describe("security remediation inputs", () => {
       rmSync(npmDir, { recursive: true, force: true });
     }
   });
+
+  it("accepts an explicit official npm registry without credentials", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-official-"));
+    try {
+      writeFileSync(join(dir, "package.json"), `${JSON.stringify({
+        name: "official-npm-fixture", private: true, dependencies: { uuid: "9.0.1" },
+      })}\n`);
+      execFileSync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], {
+        cwd: dir,
+        stdio: "ignore",
+      });
+      writeFileSync(join(dir, ".npmrc"), [
+        "registry=https://registry.npmjs.org/",
+        "@example:registry=https://registry.npmjs.org/ ; trusted public registry",
+        "",
+      ].join("\n"));
+      expect(() => updateNpm({ ...osv, sourcePath: join(dir, "package-lock.json") })).not.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("merges only after every explicitly named check passes", () => {
     const rollup = [

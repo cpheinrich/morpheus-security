@@ -29,6 +29,8 @@ Missing evidence fails closed. Registry-to-git, URL, or local-path source change
 npm and pnpm run with scripts disabled, public npmjs configuration forced, secrets removed from
 their subprocess environment, and changed pnpm integrity checked against registry.npmjs.org. uv
 runs with builds disabled and accepts changed artifacts only from hashed PyPI releases.
+An explicit repository `.npmrc` is accepted only when its registry entries name
+`https://registry.npmjs.org/` and it contains no credential configuration.
 
 ## Pull requests and merges
 
