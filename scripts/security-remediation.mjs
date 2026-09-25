@@ -204,8 +204,9 @@ function assertOfficialNpmConfiguration(root) {
     }
     for (const line of text.split(/\r?\n/)) {
       if (/^\s*[#;]/.test(line) || !line.trim()) continue;
-      const registry = /^\s*(?:@[^:\s]+:)?registry\s*=\s*(\S+)\s*$/i.exec(line);
-      if (registry && !/^https:\/\/registry\.npmjs\.org\/?$/i.test(registry[1])) {
+      const registry = /^\s*(?:@[^:\s]+:)?registry\s*=\s*(.*?)\s*$/i.exec(line);
+      const value = registry?.[1].replace(/\s+[;#].*$/, "").trim();
+      if (registry && !/^https:\/\/registry\.npmjs\.org\/?$/i.test(value)) {
         throw new Error(`Refusing repository registry or credential configuration in ${relative(root, path)}`);
       }
     }

@@ -134,6 +134,12 @@ describe("security remediation inputs", () => {
       writeFileSync(join(pnpmDir, ".npmrc"), "registry=https://evil.example/\n");
       expect(() => updatePnpm({ ...osv, dependency: "yaml", fixedVersion: "2.9.1", sourcePath: join(pnpmDir, "pnpm-lock.yaml") }))
         .toThrow("registry or credential configuration");
+      writeFileSync(join(pnpmDir, ".npmrc"), "registry=https://evil.example/ # trailing comment\n");
+      expect(() => updatePnpm({ ...osv, dependency: "yaml", fixedVersion: "2.9.1", sourcePath: join(pnpmDir, "pnpm-lock.yaml") }))
+        .toThrow("registry or credential configuration");
+      writeFileSync(join(pnpmDir, ".npmrc"), "@unsafe:registry=https://evil.example/ ; trailing comment\n");
+      expect(() => updatePnpm({ ...osv, dependency: "yaml", fixedVersion: "2.9.1", sourcePath: join(pnpmDir, "pnpm-lock.yaml") }))
+        .toThrow("registry or credential configuration");
 
       writeFileSync(join(npmDir, "package.json"), `${JSON.stringify({
         name: "unsafe-npm-fixture", private: true, dependencies: { uuid: "git+https://example.com/uuid.git" },
@@ -157,7 +163,11 @@ describe("security remediation inputs", () => {
         cwd: dir,
         stdio: "ignore",
       });
-      writeFileSync(join(dir, ".npmrc"), "registry=https://registry.npmjs.org/\n");
+      writeFileSync(join(dir, ".npmrc"), [
+        "registry=https://registry.npmjs.org/",
+        "@example:registry=https://registry.npmjs.org/ ; trusted public registry",
+        "",
+      ].join("\n"));
       expect(() => updateNpm({ ...osv, sourcePath: join(dir, "package-lock.json") })).not.toThrow();
     } finally {
       rmSync(dir, { recursive: true, force: true });
