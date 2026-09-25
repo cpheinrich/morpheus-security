@@ -189,9 +189,9 @@ describe("security remediation inputs", () => {
     ], ["test"])).toEqual(expect.objectContaining({ ready: false }));
   });
 
-  it("normalizes the newest REST check and status results without Actions access", () => {
+  it("normalizes REST checks and the newest legacy status without Actions access", () => {
     const rollup = restCheckRollup([
-      { id: 1, name: "test", app: { id: 10 }, status: "completed", conclusion: "failure" },
+      { id: 1, name: "test", app: { id: 10 }, status: "completed", conclusion: "cancelled" },
       { id: 2, name: "test", app: { id: 10 }, status: "completed", conclusion: "success" },
       { id: 3, name: "build", app: { id: 10 }, status: "in_progress", conclusion: null },
     ], [
@@ -204,10 +204,10 @@ describe("security remediation inputs", () => {
       .toEqual(expect.objectContaining({ ready: false }));
   });
 
-  it("does not let a same-named check from another App erase a failure", () => {
+  it("does not let a same-named check from another App or suite erase a failure", () => {
     const rollup = restCheckRollup([
-      { id: 10, name: "test", app: { id: 1 }, status: "completed", conclusion: "failure" },
-      { id: 11, name: "test", app: { id: 2 }, status: "completed", conclusion: "success" },
+      { id: 10, name: "test", app: { id: 1 }, check_suite: { id: 100 }, status: "completed", conclusion: "failure" },
+      { id: 11, name: "test", app: { id: 1 }, check_suite: { id: 200 }, status: "completed", conclusion: "success" },
     ], []);
     expect(requiredChecksReady(rollup, ["test"]))
       .toEqual(expect.objectContaining({ ready: false }));

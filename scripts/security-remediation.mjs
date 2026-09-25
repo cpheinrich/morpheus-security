@@ -540,9 +540,13 @@ export function requiredChecksReady(rollup, requiredChecks) {
   for (const requiredCheck of requiredChecks) {
     const matches = (rollup ?? []).filter((check) => (check.name ?? check.context) === requiredCheck);
     if (matches.length === 0) return { ready: false, reason: `required check is missing: ${requiredCheck}` };
-    const successful = matches.every((check) =>
+    const accepted = matches.every((check) => {
+      if (check.status !== "COMPLETED") return check.state === "SUCCESS";
+      return ["SUCCESS", "CANCELLED", "SKIPPED", "NEUTRAL"].includes(check.conclusion);
+    });
+    const hasSuccess = matches.some((check) =>
       check.status === "COMPLETED" ? check.conclusion === "SUCCESS" : check.state === "SUCCESS");
-    if (!successful) return { ready: false, reason: `required check has not passed: ${requiredCheck}` };
+    if (!accepted || !hasSuccess) return { ready: false, reason: `required check has not passed: ${requiredCheck}` };
   }
   return { ready: true, reason: "all explicit required checks passed" };
 }
@@ -555,20 +559,13 @@ export function staleCandidateAction(mergeStateStatus) {
 }
 
 export function restCheckRollup(checkRuns, commitStatuses) {
-  const latestChecks = new Map();
-  for (const check of checkRuns ?? []) {
-    const app = check.app?.id ?? check.app?.slug ?? "unknown";
-    const key = `${app}\0${check.name}`;
-    const current = latestChecks.get(key);
-    if (!current || Number(check.id ?? 0) > Number(current.id ?? 0)) latestChecks.set(key, check);
-  }
   const latestStatuses = new Map();
   for (const status of commitStatuses ?? []) {
     const current = latestStatuses.get(status.context);
     if (!current || Number(status.id ?? 0) > Number(current.id ?? 0)) latestStatuses.set(status.context, status);
   }
   return [
-    ...[...latestChecks.values()].map((check) => ({
+    ...(checkRuns ?? []).map((check) => ({
       name: check.name,
       status: String(check.status ?? "").toUpperCase(),
       conclusion: check.conclusion == null ? null : String(check.conclusion).toUpperCase(),
