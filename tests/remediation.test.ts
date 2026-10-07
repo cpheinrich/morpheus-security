@@ -198,6 +198,35 @@ describe("security remediation inputs", () => {
     }
   }, 30_000);
 
+  it("preserves separate direct pnpm major lines while fixing both", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-direct-lines-"));
+    try {
+      mkdirSync(join(dir, "packages", "legacy"), { recursive: true });
+      mkdirSync(join(dir, "packages", "current"), { recursive: true });
+      writeFileSync(join(dir, "package.json"), `${JSON.stringify({ name: "direct-lines", private: true, packageManager: "pnpm@11.9.0" })}\n`);
+      writeFileSync(join(dir, "pnpm-workspace.yaml"), "packages:\n  - packages/*\n");
+      const legacyPath = join(dir, "packages", "legacy", "package.json");
+      const currentPath = join(dir, "packages", "current", "package.json");
+      writeFileSync(legacyPath, `${JSON.stringify({ name: "legacy", dependencies: { "brace-expansion": "1.1.15" } })}\n`);
+      writeFileSync(currentPath, `${JSON.stringify({ name: "current", dependencies: { "brace-expansion": "5.0.5" } })}\n`);
+      execFileSync("pnpm", ["install", "--lockfile-only", "--ignore-scripts"], { cwd: dir, stdio: "ignore" });
+      const lockfile = join(dir, "pnpm-lock.yaml");
+      const first = { ...osv, dependency: "brace-expansion", version: "1.1.15", fixedVersion: "1.1.16", sourcePath: lockfile };
+      const second = { ...first, version: "5.0.5", fixedVersion: "5.0.6" };
+      const result = applyAffectedUpdates([first, second], first);
+      expect(result.updates.map((entry: { version: string }) => entry.version)).toEqual(["1.1.15", "5.0.5"]);
+      expect(JSON.parse(readFileSync(legacyPath, "utf8")).dependencies["brace-expansion"]).toBe("1.1.16");
+      expect(JSON.parse(readFileSync(currentPath, "utf8")).dependencies["brace-expansion"]).toBe("5.0.6");
+      const packages = readFileSync(lockfile, "utf8").split("\npackages:\n")[1];
+      expect(packages).toContain("brace-expansion@1.1.16");
+      expect(packages).toContain("brace-expansion@5.0.6");
+      expect(packages).not.toContain("brace-expansion@1.1.15");
+      expect(packages).not.toContain("brace-expansion@5.0.5");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("preserves unrelated pnpm transitive major lines", () => {
     const dir = mkdtempSync(join(tmpdir(), "morpheus-security-pnpm-lines-"));
     try {

@@ -292,14 +292,20 @@ function pnpmLock(lockfile) {
 
 function pnpmDirectManifests(lockfile, dependency) {
   const root = packageRoot(lockfile);
-  const importers = Object.keys(pnpmLock(lockfile)?.importers ?? { ".": {} });
+  const importers = pnpmLock(lockfile)?.importers ?? { ".": {} };
   const groups = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
-  return importers.flatMap((importer) => {
+  return Object.keys(importers).flatMap((importer) => {
     const manifestPath = join(root, importer === "." ? "package.json" : `${importer}/package.json`);
     if (!existsSync(manifestPath)) return [];
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
     const group = groups.find((name) => Object.hasOwn(manifest[name] ?? {}, dependency));
-    return group ? [{ manifestPath, manifest, group }] : [];
+    if (!group) return [];
+    const resolution = importers[importer]?.[group]?.[dependency];
+    const version = typeof resolution === "string" ? resolution : resolution?.version;
+    if (typeof version !== "string" || !/^\d/.test(version)) {
+      throw new Error(`Cannot identify the resolved pnpm direct version of ${dependency} in ${manifestPath}`);
+    }
+    return [{ manifestPath, manifest, group, version: version.split("(")[0] }];
   });
 }
 
@@ -335,7 +341,8 @@ export function updatePnpm(finding) {
   // A nested lockfile is its own project. Without this flag pnpm may discover
   // an ancestor workspace and mutate its lockfile instead of this one.
   const workspaceArgs = existsSync(join(root, "pnpm-workspace.yaml")) ? [] : ["--ignore-workspace"];
-  const direct = pnpmDirectManifests(finding.sourcePath, finding.dependency);
+  const allDirect = pnpmDirectManifests(finding.sourcePath, finding.dependency);
+  const direct = allDirect.filter((entry) => entry.version === finding.version);
   if (finding.malicious && !finding.fixedVersion) {
     if (direct.length === 0) throw new Error(`Malicious transitive ${finding.dependency} has no fixed version; incident opened but automatic removal is unsafe`);
     for (const entry of direct) {
@@ -360,10 +367,12 @@ export function updatePnpm(finding) {
     return { strategy: "pnpm-direct", manifestPath: direct.map((entry) => relative(process.cwd(), entry.manifestPath)).join(","), beforeLock };
   }
 
-  packageRun("pnpm", ["update", `${finding.dependency}@${finding.fixedVersion}`, "--recursive", "--lockfile-only", "--ignore-scripts", ...workspaceArgs, ...registryArgs(finding.dependency)], { cwd: root });
-  const updated = installedPnpmVersions(finding.sourcePath, finding.dependency);
-  if (updated.length > 0 && !updated.includes(finding.version)) {
-    return { strategy: "pnpm-transitive-compatible", manifestPath: null, beforeLock };
+  if (allDirect.length === 0) {
+    packageRun("pnpm", ["update", `${finding.dependency}@${finding.fixedVersion}`, "--recursive", "--lockfile-only", "--ignore-scripts", ...workspaceArgs, ...registryArgs(finding.dependency)], { cwd: root });
+    const updated = installedPnpmVersions(finding.sourcePath, finding.dependency);
+    if (updated.length > 0 && !updated.includes(finding.version)) {
+      return { strategy: "pnpm-transitive-compatible", manifestPath: null, beforeLock };
+    }
   }
 
   const manifestPath = writePnpmOverride(root, finding.dependency, finding.version, finding.fixedVersion);
