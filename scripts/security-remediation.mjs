@@ -326,11 +326,23 @@ function installedPnpmVersions(lockfile, dependency) {
     .filter(Boolean))];
 }
 
+function overrideTargetsDependency(selector, dependency) {
+  return selector === dependency || selector.startsWith(`${dependency}@`) ||
+    selector.endsWith(`>${dependency}`) || selector.includes(`>${dependency}@`);
+}
+
 function writePnpmOverride(root, dependency, installedVersion, fixedVersion) {
   const selector = `${dependency}@${installedVersion}`;
   const workspacePath = join(root, "pnpm-workspace.yaml");
   if (existsSync(workspacePath)) {
     const document = parseDocument(readFileSync(workspacePath, "utf8"));
+    // pnpm does not apply overrides transitively. An older selector may already
+    // map a source release to this vulnerable installed version; update it too.
+    for (const [key, value] of Object.entries(document.toJS().overrides ?? {})) {
+      if (overrideTargetsDependency(key, dependency) && value === installedVersion) {
+        document.setIn(["overrides", key], fixedVersion);
+      }
+    }
     document.setIn(["overrides", selector], fixedVersion);
     writeFileSync(workspacePath, String(document));
     return relative(process.cwd(), workspacePath);
@@ -338,7 +350,11 @@ function writePnpmOverride(root, dependency, installedVersion, fixedVersion) {
   const manifestPath = join(root, "package.json");
   if (!existsSync(manifestPath)) throw new Error(`No package.json beside ${join(root, "pnpm-lock.yaml")}`);
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-  manifest.pnpm = { ...(manifest.pnpm ?? {}), overrides: { ...(manifest.pnpm?.overrides ?? {}), [selector]: fixedVersion } };
+  const overrides = { ...(manifest.pnpm?.overrides ?? {}) };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (overrideTargetsDependency(key, dependency) && value === installedVersion) overrides[key] = fixedVersion;
+  }
+  manifest.pnpm = { ...(manifest.pnpm ?? {}), overrides: { ...overrides, [selector]: fixedVersion } };
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   return relative(process.cwd(), manifestPath);
 }

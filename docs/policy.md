@@ -36,6 +36,8 @@ An explicit repository `.npmrc` is accepted only when its registry entries name
 `https://registry.npmjs.org/` and it contains no credential configuration.
 When a transitive npm or pnpm parent range cannot reach a fix, the generated override is scoped to
 the vulnerable installed version so parallel incompatible major lines are not collapsed.
+When an earlier pnpm override resolves to that vulnerable version, the updater also advances the
+earlier selector; pnpm does not chain overrides.
 
 ## Pull requests and merges
 
