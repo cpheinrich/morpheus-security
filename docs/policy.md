@@ -35,7 +35,9 @@ the vulnerable installed version so parallel incompatible major lines are not co
 
 ## Pull requests and merges
 
-One dependency is one pull request. At most one bot PR is open per lockfile, so updates cannot race
+One dependency is one pull request, including every affected installed version of that dependency
+in the selected lockfile. Versions on incompatible lines receive their own smallest fixed version.
+At most one bot PR is open per lockfile, so updates cannot race
 the same lock graph. The creation run records an App-owned Check Run attestation for the exact
 candidate head and never merges it. A later nightly reconciliation requires that attestation,
 requires every explicitly configured `requiredChecks` entry to have passed, and atomically limits
