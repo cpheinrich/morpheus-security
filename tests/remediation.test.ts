@@ -301,6 +301,39 @@ describe("security remediation inputs", () => {
     }
   }, 30_000);
 
+  it("updates an older pnpm override that still resolves to the vulnerable version", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-pnpm-chain-"));
+    try {
+      writeFileSync(join(dir, "package.json"), `${JSON.stringify({
+        name: "pnpm-security-override-chain", private: true, packageManager: "pnpm@11.9.0",
+        dependencies: { minimatch: "3.1.5" },
+      })}\n`);
+      writeFileSync(join(dir, "pnpm-workspace.yaml"), [
+        "packages: []",
+        "overrides:",
+        "  brace-expansion@1.1.15: 1.1.16",
+        "  unrelated@1.0.0: 1.1.16",
+        "",
+      ].join("\n"));
+      execFileSync("pnpm", ["install", "--lockfile-only", "--ignore-scripts"], { cwd: dir, stdio: "ignore" });
+      const lockfile = join(dir, "pnpm-lock.yaml");
+      expect(readFileSync(lockfile, "utf8")).toContain("brace-expansion@1.1.16");
+
+      updatePnpm({ ...osv, dependency: "brace-expansion", version: "1.1.16",
+        fixedVersion: "1.1.19", sourcePath: lockfile });
+
+      const updated = readFileSync(lockfile, "utf8");
+      const workspace = readFileSync(join(dir, "pnpm-workspace.yaml"), "utf8");
+      const packages = updated.split("\npackages:\n")[1];
+      expect(packages).toContain("brace-expansion@1.1.19");
+      expect(packages).not.toContain("brace-expansion@1.1.16");
+      expect(workspace).toContain("brace-expansion@1.1.15: 1.1.19");
+      expect(workspace).toContain("unrelated@1.0.0: 1.1.16");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("accepts an npm transitive update above the first patched version", () => {
     const dir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-compatible-"));
     try {
