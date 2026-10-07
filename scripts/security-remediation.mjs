@@ -132,6 +132,15 @@ function held(finding, config) {
     (!hold.advisory || finding.aliases.includes(hold.advisory)));
 }
 
+export function nextCandidate(findings, config, open) {
+  const openLockfiles = new Set(open.map((pr) => /Lockfile: `([^`]+)`/.exec(pr.body ?? "")?.[1]).filter(Boolean));
+  return findings.find((finding) => (finding.fixedVersion || finding.malicious) &&
+    (finding.malicious || affectedVersionsForCandidate(findings, finding).every((affected) => affected.fixedVersion)) &&
+    !held(finding, config) &&
+    !open.some((pr) => String(pr.body ?? "").includes(`Dependency: \`${finding.dependency}\``)) &&
+    !openLockfiles.has(finding.sourcePath)) ?? null;
+}
+
 function slug(value) {
   return value.toLowerCase().replace(/^@/, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 45);
 }
@@ -540,15 +549,12 @@ function prepare() {
     finding.incidentUrl = upsertMalwareIncident(repo, finding, findings);
   }
 
-  const openLockfiles = new Set(open.map((pr) => /Lockfile: `([^`]+)`/.exec(pr.body ?? "")?.[1]).filter(Boolean));
-  const candidates = findings.filter((finding) => !held(finding, config) &&
-    !open.some((pr) => String(pr.body ?? "").includes(`Dependency: \`${finding.dependency}\``)) &&
-    !openLockfiles.has(finding.sourcePath));
-  const finding = candidates[0];
+  const finding = nextCandidate(findings, config, open);
   if (!finding) {
-    writeFileSync(planFile, JSON.stringify({ status: findings.length ? "waiting" : "clean", findings, open: open.map((pr) => pr.html_url) }, null, 2));
+    const unpatched = findings.filter((candidate) => !candidate.fixedVersion && !candidate.malicious);
+    writeFileSync(planFile, JSON.stringify({ status: findings.length ? "waiting" : "clean", findings, unpatched, open: open.map((pr) => pr.html_url) }, null, 2));
     output("changed", "false");
-    summary(findings.length ? `## Security remediation\n\nNo new PR: ${open.length} bot PR(s) already cover the available lockfiles, or project holds apply.` : "## Security remediation\n\nOSV and GitHub advisory inputs are clean.");
+    summary(findings.length ? `## Security remediation\n\nNo new PR: ${open.length} bot PR(s) already cover available lockfiles, project holds apply, or no fixed version is published for ${unpatched.length} finding(s). These findings remain open.` : "## Security remediation\n\nOSV and GitHub advisory inputs are clean.");
     return;
   }
 

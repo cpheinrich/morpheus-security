@@ -11,6 +11,7 @@ import {
   assertOfficialUvArtifacts,
   combineFindings,
   malwareIncidentBody,
+  nextCandidate,
   restCheckRollup,
   restMergeReadiness,
   requiredChecksReady,
@@ -51,6 +52,24 @@ describe("security remediation inputs", () => {
       ...structuredClone(osv), dependency: "other", advisory: "GHSA-two", aliases: ["GHSA-two"],
     }]);
     expect(combined.map((finding: { dependency: string }) => finding.dependency).sort()).toEqual(["other", "uuid"]);
+  });
+
+  it("passes an unpatched advisory to reach the next actionable finding", () => {
+    const unpatched = { ...osv, dependency: "sprintf-js", fixedVersion: null, advisory: "GHSA-hp3w-g68c-fv3c" };
+    const patchable = { ...osv, dependency: "other", fixedVersion: "11.1.1" };
+    expect(nextCandidate([unpatched, patchable], { holds: [] }, [])).toEqual(patchable);
+    expect(nextCandidate([unpatched], { holds: [] }, [])).toBeNull();
+    expect(nextCandidate([{ ...unpatched, malicious: true }], { holds: [] }, []))
+      .toEqual({ ...unpatched, malicious: true });
+  });
+
+  it("waits when one installed version of a selected advisory has no fix", () => {
+    const unpatched = { ...osv, dependency: "sprintf-js", version: "1.0.0", fixedVersion: null };
+    const partiallyPatchable = { ...unpatched, version: "2.0.0", fixedVersion: "2.0.1" };
+    const independent = { ...osv, dependency: "other" };
+    expect(nextCandidate([unpatched, partiallyPatchable, independent], { holds: [] }, []))
+      .toEqual(independent);
+    expect(nextCandidate([partiallyPatchable, unpatched], { holds: [] }, [])).toBeNull();
   });
 
   it("groups every vulnerable version in one lockfile without crossing lockfiles", () => {
