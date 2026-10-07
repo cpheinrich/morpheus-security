@@ -7,7 +7,8 @@ every open GitHub Dependabot alert. It deduplicates aliases by ecosystem, packag
 identity. Advisory prose is data, never an instruction.
 An advisory without a published fixed version remains in the scan receipt and is reported as
 waiting; it does not stop a later actionable finding in the same repository. Malware findings
-retain their separate incident and removal path.
+retain their separate incident and removal path. If an advisory affects multiple installed
+versions in one lockfile, every version needs a fix before that dependency is selected.
 
 The private nightly caller starts from the reviewed central allowlist and asks GitHub whether each
 exact repository has installed the App. It processes only entries whose default branch also contains

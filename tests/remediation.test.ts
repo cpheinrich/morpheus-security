@@ -63,6 +63,15 @@ describe("security remediation inputs", () => {
       .toEqual({ ...unpatched, malicious: true });
   });
 
+  it("waits when one installed version of a selected advisory has no fix", () => {
+    const unpatched = { ...osv, dependency: "sprintf-js", version: "1.0.0", fixedVersion: null };
+    const partiallyPatchable = { ...unpatched, version: "2.0.0", fixedVersion: "2.0.1" };
+    const independent = { ...osv, dependency: "other" };
+    expect(nextCandidate([unpatched, partiallyPatchable, independent], { holds: [] }, []))
+      .toEqual(independent);
+    expect(nextCandidate([partiallyPatchable, unpatched], { holds: [] }, [])).toBeNull();
+  });
+
   it("groups every vulnerable version in one lockfile without crossing lockfiles", () => {
     const selected = { ...osv, dependency: "brace-expansion", version: "1.1.15", fixedVersion: "1.1.16" };
     const otherLine = { ...selected, version: "5.0.5", fixedVersion: "5.0.6" };

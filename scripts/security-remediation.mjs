@@ -135,6 +135,7 @@ function held(finding, config) {
 export function nextCandidate(findings, config, open) {
   const openLockfiles = new Set(open.map((pr) => /Lockfile: `([^`]+)`/.exec(pr.body ?? "")?.[1]).filter(Boolean));
   return findings.find((finding) => (finding.fixedVersion || finding.malicious) &&
+    (finding.malicious || affectedVersionsForCandidate(findings, finding).every((affected) => affected.fixedVersion)) &&
     !held(finding, config) &&
     !open.some((pr) => String(pr.body ?? "").includes(`Dependency: \`${finding.dependency}\``)) &&
     !openLockfiles.has(finding.sourcePath)) ?? null;
