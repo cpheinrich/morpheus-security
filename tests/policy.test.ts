@@ -43,6 +43,14 @@ describe("security remediation policy", () => {
     })]);
   });
 
+  it("accepts ecosystem-specific OSV IDs and rejects unsafe identifiers", () => {
+    const ecosystemScan = structuredClone(scan);
+    ecosystemScan.results[0]!.packages[0]!.vulnerabilities[0]!.id = "PYSEC-2026-4175";
+    expect(findingsFromOsvJson(ecosystemScan)[0]?.advisory).toBe("PYSEC-2026-4175");
+    ecosystemScan.results[0]!.packages[0]!.vulnerabilities[0]!.id = "PYSEC-2026-4175\nunsafe";
+    expect(() => findingsFromOsvJson(ecosystemScan)).toThrow("unrecognized advisory id");
+  });
+
   it("drops withdrawn advisories and prioritizes MAL findings", () => {
     const malicious = structuredClone(scan) as unknown as {
       results: Array<{ packages: Array<{ vulnerabilities: Array<{

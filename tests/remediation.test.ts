@@ -4,6 +4,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  affectedVersionsForCandidate,
+  applyAffectedUpdates,
   assertOfficialNpmArtifacts,
   assertOfficialPnpmArtifacts,
   assertOfficialUvArtifacts,
@@ -49,6 +51,15 @@ describe("security remediation inputs", () => {
       ...structuredClone(osv), dependency: "other", advisory: "GHSA-two", aliases: ["GHSA-two"],
     }]);
     expect(combined.map((finding: { dependency: string }) => finding.dependency).sort()).toEqual(["other", "uuid"]);
+  });
+
+  it("groups every vulnerable version in one lockfile without crossing lockfiles", () => {
+    const selected = { ...osv, dependency: "brace-expansion", version: "1.1.15", fixedVersion: "1.1.16" };
+    const otherLine = { ...selected, version: "5.0.5", fixedVersion: "5.0.6" };
+    expect(affectedVersionsForCandidate([
+      selected, otherLine, { ...selected, sourcePath: "plugins/tool/pnpm-lock.yaml" },
+      { ...selected, version: "2.0.0", aliases: ["GHSA-unrelated"] },
+    ], selected).map((finding: { version: string }) => finding.version)).toEqual(["1.1.15", "5.0.5"]);
   });
 
   it("rejects changed npm entries without registry provenance", () => {
@@ -132,6 +143,56 @@ describe("security remediation inputs", () => {
       expect(manifest.dependencies.yaml).toBe("2.9.1");
       expect(readFileSync(lockfile, "utf8")).toContain("yaml@2.9.1");
       expect(() => assertOfficialPnpmArtifacts(lockfile, beforeLock)).not.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("updates a nested standalone lockfile without mutating an ancestor workspace", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-nested-pnpm-"));
+    try {
+      const nested = join(dir, "plugins", "tool");
+      mkdirSync(nested, { recursive: true });
+      writeFileSync(join(dir, "pnpm-workspace.yaml"), "packages:\n  - plugins/*\n");
+      writeFileSync(join(dir, "package.json"), `${JSON.stringify({ name: "parent", private: true, dependencies: { yaml: "2.9.0" } })}\n`);
+      writeFileSync(join(nested, "package.json"), `${JSON.stringify({ name: "nested", private: true, dependencies: { yaml: "2.9.0" } })}\n`);
+      execFileSync("pnpm", ["install", "--lockfile-only", "--ignore-scripts"], { cwd: dir, stdio: "ignore" });
+      execFileSync("pnpm", ["install", "--lockfile-only", "--ignore-scripts", "--ignore-workspace"], { cwd: nested, stdio: "ignore" });
+      const rootLock = readFileSync(join(dir, "pnpm-lock.yaml"), "utf8");
+      const nestedLock = join(nested, "pnpm-lock.yaml");
+      const beforeNested = readFileSync(nestedLock, "utf8");
+      updatePnpm({ ...osv, dependency: "yaml", version: "2.9.0", fixedVersion: "2.9.1", sourcePath: nestedLock });
+      expect(readFileSync(nestedLock, "utf8")).not.toBe(beforeNested);
+      expect(readFileSync(nestedLock, "utf8")).toContain("yaml@2.9.1");
+      expect(readFileSync(join(dir, "pnpm-lock.yaml"), "utf8")).toBe(rootLock);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("updates two affected pnpm lines in the same candidate", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-two-lines-"));
+    try {
+      mkdirSync(join(dir, "packages", "legacy"), { recursive: true });
+      mkdirSync(join(dir, "packages", "current"), { recursive: true });
+      writeFileSync(join(dir, "package.json"), `${JSON.stringify({ name: "two-lines", private: true, packageManager: "pnpm@11.9.0" })}\n`);
+      writeFileSync(join(dir, "pnpm-workspace.yaml"), [
+        "packages:", "  - packages/*", "overrides:",
+        "  brace-expansion@<2: 1.1.15", "  brace-expansion@>=5: 5.0.5", "",
+      ].join("\n"));
+      writeFileSync(join(dir, "packages", "legacy", "package.json"), `${JSON.stringify({ name: "legacy", dependencies: { minimatch: "3.1.5" } })}\n`);
+      writeFileSync(join(dir, "packages", "current", "package.json"), `${JSON.stringify({ name: "current", dependencies: { minimatch: "10.2.5" } })}\n`);
+      execFileSync("pnpm", ["install", "--lockfile-only", "--ignore-scripts"], { cwd: dir, stdio: "ignore" });
+      const lockfile = join(dir, "pnpm-lock.yaml");
+      const first = { ...osv, dependency: "brace-expansion", version: "1.1.15", fixedVersion: "1.1.16", sourcePath: lockfile };
+      const second = { ...first, version: "5.0.5", fixedVersion: "5.0.6" };
+      const result = applyAffectedUpdates([first, second], first);
+      const packages = readFileSync(lockfile, "utf8").split("\npackages:\n")[1];
+      expect(result.updates.map((entry: { version: string }) => entry.version)).toEqual(["1.1.15", "5.0.5"]);
+      expect(packages).toContain("brace-expansion@1.1.16");
+      expect(packages).toContain("brace-expansion@5.0.6");
+      expect(packages).not.toContain("brace-expansion@1.1.15");
+      expect(packages).not.toContain("brace-expansion@5.0.5");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

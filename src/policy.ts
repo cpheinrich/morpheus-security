@@ -75,7 +75,10 @@ export function findingsFromOsvJson(value: unknown): SecurityFinding[] {
         throw new Error("OSV package result is incomplete");
       }
       for (const vulnerability of entry.vulnerabilities) {
-        if (!vulnerability.id || !/^(?:GHSA|CVE|MAL|OSV)-/.test(vulnerability.id)) {
+        // OSV includes ecosystem-specific IDs such as PYSEC and RUSTSEC.
+        // Keep the identifier safe for PR text and branch names without
+        // limiting the advisory authorities accepted from the pinned scanner.
+        if (!vulnerability.id || !/^[A-Z][A-Z0-9]{1,31}-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(vulnerability.id)) {
           throw new Error("OSV vulnerability has an unrecognized advisory id");
         }
         findings.push({

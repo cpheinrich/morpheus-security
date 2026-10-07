@@ -332,6 +332,9 @@ export function updatePnpm(finding) {
   const root = packageRoot(finding.sourcePath);
   assertOfficialNpmConfiguration(root);
   const beforeLock = readFileSync(finding.sourcePath, "utf8");
+  // A nested lockfile is its own project. Without this flag pnpm may discover
+  // an ancestor workspace and mutate its lockfile instead of this one.
+  const workspaceArgs = existsSync(join(root, "pnpm-workspace.yaml")) ? [] : ["--ignore-workspace"];
   const direct = pnpmDirectManifests(finding.sourcePath, finding.dependency);
   if (finding.malicious && !finding.fixedVersion) {
     if (direct.length === 0) throw new Error(`Malicious transitive ${finding.dependency} has no fixed version; incident opened but automatic removal is unsafe`);
@@ -339,7 +342,7 @@ export function updatePnpm(finding) {
       delete entry.manifest[entry.group][finding.dependency];
       writeFileSync(entry.manifestPath, `${JSON.stringify(entry.manifest, null, 2)}\n`);
     }
-    packageRun("pnpm", ["install", "--lockfile-only", "--ignore-scripts", ...registryArgs(finding.dependency)], { cwd: root });
+    packageRun("pnpm", ["install", "--lockfile-only", "--ignore-scripts", ...workspaceArgs, ...registryArgs(finding.dependency)], { cwd: root });
     return { strategy: "remove-malicious-direct", manifestPath: direct.map((entry) => relative(process.cwd(), entry.manifestPath)).join(","), beforeLock };
   }
   if (!finding.fixedVersion) throw new Error(`${finding.advisory} has no fixed version`);
@@ -353,18 +356,18 @@ export function updatePnpm(finding) {
       entry.manifest[entry.group][finding.dependency] = `${prefix}${finding.fixedVersion}`;
       writeFileSync(entry.manifestPath, `${JSON.stringify(entry.manifest, null, 2)}\n`);
     }
-    packageRun("pnpm", ["install", "--lockfile-only", "--ignore-scripts", ...registryArgs(finding.dependency)], { cwd: root });
+    packageRun("pnpm", ["install", "--lockfile-only", "--ignore-scripts", ...workspaceArgs, ...registryArgs(finding.dependency)], { cwd: root });
     return { strategy: "pnpm-direct", manifestPath: direct.map((entry) => relative(process.cwd(), entry.manifestPath)).join(","), beforeLock };
   }
 
-  packageRun("pnpm", ["update", `${finding.dependency}@${finding.fixedVersion}`, "--recursive", "--lockfile-only", "--ignore-scripts", ...registryArgs(finding.dependency)], { cwd: root });
+  packageRun("pnpm", ["update", `${finding.dependency}@${finding.fixedVersion}`, "--recursive", "--lockfile-only", "--ignore-scripts", ...workspaceArgs, ...registryArgs(finding.dependency)], { cwd: root });
   const updated = installedPnpmVersions(finding.sourcePath, finding.dependency);
   if (updated.length > 0 && !updated.includes(finding.version)) {
     return { strategy: "pnpm-transitive-compatible", manifestPath: null, beforeLock };
   }
 
   const manifestPath = writePnpmOverride(root, finding.dependency, finding.version, finding.fixedVersion);
-  packageRun("pnpm", ["install", "--lockfile-only", "--ignore-scripts", ...registryArgs(finding.dependency)], { cwd: root });
+  packageRun("pnpm", ["install", "--lockfile-only", "--ignore-scripts", ...workspaceArgs, ...registryArgs(finding.dependency)], { cwd: root });
   return { strategy: "pnpm-transitive-override", manifestPath, beforeLock };
 }
 
@@ -374,6 +377,41 @@ function applyUpdate(finding) {
   if (base === "pnpm-lock.yaml") return updatePnpm(finding);
   if (base === "uv.lock") return updateUv(finding);
   throw new Error(`No remediation adapter for ${base}; OSV detection still covers it`);
+}
+
+export function affectedVersionsForCandidate(findings, selected) {
+  const seen = new Set();
+  return [selected, ...findings].filter((finding) => {
+    if (finding.sourcePath !== selected.sourcePath ||
+        finding.ecosystem.toLowerCase() !== selected.ecosystem.toLowerCase() ||
+        finding.dependency !== selected.dependency ||
+        !finding.aliases.some((alias) => selected.aliases.includes(alias)) ||
+        seen.has(finding.version)) return false;
+    seen.add(finding.version);
+    return true;
+  });
+}
+
+function versionStillInstalled(finding) {
+  if (basename(finding.sourcePath) === "package-lock.json") {
+    return installedNpmVersions(finding.sourcePath, finding.dependency).includes(finding.version);
+  }
+  if (basename(finding.sourcePath) === "pnpm-lock.yaml") {
+    return installedPnpmVersions(finding.sourcePath, finding.dependency).includes(finding.version);
+  }
+  return true;
+}
+
+export function applyAffectedUpdates(findings, selected) {
+  const updates = [];
+  let update;
+  for (const affected of affectedVersionsForCandidate(findings, selected)) {
+    if (updates.length > 0 && !versionStillInstalled(affected)) continue;
+    const applied = applyUpdate(affected);
+    update ??= applied;
+    updates.push({ version: affected.version, fixedVersion: affected.fixedVersion, strategy: applied.strategy });
+  }
+  return { update, updates };
 }
 
 export function assertOfficialNpmArtifacts(lockfile, beforeText) {
@@ -507,22 +545,21 @@ function prepare() {
 
   const beforeLock = ["package-lock.json", "pnpm-lock.yaml"].includes(basename(finding.sourcePath))
     ? readFileSync(finding.sourcePath, "utf8") : null;
-  const update = applyUpdate(finding);
+  const { update, updates } = applyAffectedUpdates(findings, finding);
   const changedFiles = run("git", ["diff", "--name-only"]).split("\n").filter(Boolean);
   if (!isSecurityDependencyOnly(changedFiles)) throw new Error(`Updater changed a disallowed path: ${changedFiles.join(", ")}`);
   if (!changedFiles.includes(finding.sourcePath)) throw new Error(`Updater did not change ${finding.sourcePath}`);
   if (beforeLock && basename(finding.sourcePath) === "package-lock.json") {
     assertOfficialNpmArtifacts(finding.sourcePath, beforeLock);
   }
-  if (update.beforeLock && basename(finding.sourcePath) === "pnpm-lock.yaml") {
-    assertOfficialPnpmArtifacts(finding.sourcePath, update.beforeLock);
-    delete update.beforeLock;
+  if (beforeLock && basename(finding.sourcePath) === "pnpm-lock.yaml") {
+    assertOfficialPnpmArtifacts(finding.sourcePath, beforeLock);
   }
   if (update.beforeLock) {
     assertOfficialUvArtifacts(finding.sourcePath, update.beforeLock);
     delete update.beforeLock;
   }
-  const plan = { status: "prepared", finding, update, changedFiles, beforeSha: run("git", ["rev-parse", "HEAD"]) };
+  const plan = { status: "prepared", finding, update, updates, changedFiles, beforeSha: run("git", ["rev-parse", "HEAD"]) };
   mkdirSync(dirname(planFile), { recursive: true });
   writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
   output("changed", "true");
@@ -655,7 +692,8 @@ function deliver() {
   const plan = JSON.parse(readFileSync(required("PLAN_FILE"), "utf8"));
   const after = findingsFromOsvJson(JSON.parse(readFileSync(required("AFTER_SCAN_FILE"), "utf8")));
   const finding = plan.finding;
-  const remains = after.some((candidate) => candidate.dependency === finding.dependency &&
+  const remains = after.some((candidate) => candidate.sourcePath === finding.sourcePath &&
+    candidate.dependency === finding.dependency &&
     candidate.aliases.some((alias) => finding.aliases.includes(alias)));
   if (remains) throw new Error(`${finding.advisory} remains after the candidate update`);
 
@@ -681,11 +719,14 @@ function deliver() {
   createCandidateAttestation(repo, finding, candidateHead);
   ensureSecurityLabels(repo);
   const incident = finding.incidentUrl ? `\nRelated incident: ${finding.incidentUrl}` : "";
+  const updateLines = (plan.updates ?? [{ version: finding.version, fixedVersion: finding.fixedVersion, strategy: plan.update.strategy }])
+    .map((entry) => `- Update \`${entry.version}\` to the smallest available fixed line, \`${entry.fixedVersion ?? "removed"}\`, using \`${entry.strategy}\`.`)
+    .join("\n");
   const body = `${SECURITY_MARKER}\n\n## Summary\n\n` +
     `Dependency: \`${finding.dependency}\`\n\nLockfile: \`${finding.sourcePath}\`\n\n` +
     `Advisories: ${finding.aliases.map((alias) => `\`${alias}\``).join(", ")}\n\n` +
     `- Remediate ${finding.advisory} (${finding.aliases.join(", ")}).\n` +
-    `- Update \`${finding.version}\` to the smallest available fixed line, \`${finding.fixedVersion ?? "removed"}\`, using \`${plan.update.strategy}\`.\n` +
+    `${updateLines}\n` +
     `- OSV rescanned the candidate and no longer reports this package/advisory pair.\n` +
     `- Registry URLs and lockfile integrity hashes passed the deterministic supply-chain gate.\n` +
     `- Candidate head: \`${candidateHead}\`.${incident}\n\n` +
