@@ -11,6 +11,7 @@ import {
   assertOfficialUvArtifacts,
   combineFindings,
   malwareIncidentBody,
+  nextCandidate,
   restCheckRollup,
   restMergeReadiness,
   requiredChecksReady,
@@ -51,6 +52,15 @@ describe("security remediation inputs", () => {
       ...structuredClone(osv), dependency: "other", advisory: "GHSA-two", aliases: ["GHSA-two"],
     }]);
     expect(combined.map((finding: { dependency: string }) => finding.dependency).sort()).toEqual(["other", "uuid"]);
+  });
+
+  it("passes an unpatched advisory to reach the next actionable finding", () => {
+    const unpatched = { ...osv, dependency: "sprintf-js", fixedVersion: null, advisory: "GHSA-hp3w-g68c-fv3c" };
+    const patchable = { ...osv, dependency: "other", fixedVersion: "11.1.1" };
+    expect(nextCandidate([unpatched, patchable], { holds: [] }, [])).toEqual(patchable);
+    expect(nextCandidate([unpatched], { holds: [] }, [])).toBeNull();
+    expect(nextCandidate([{ ...unpatched, malicious: true }], { holds: [] }, []))
+      .toEqual({ ...unpatched, malicious: true });
   });
 
   it("groups every vulnerable version in one lockfile without crossing lockfiles", () => {
