@@ -44,6 +44,15 @@ file. Removing the policy file opts the repository out without changing the inst
 list permits scans and PR creation but disables automatic merging. Branch protection and review
 rules remain additional GitHub-enforced gates.
 
+`importOnlyCompatibility` is optional and defaults to false. Set it to true only where a distinct
+Manager App reviewer is installed and the repository's PR check verifies its exact-head review.
+The engine's reviewed `config/compatibility-replacements.json` supplies an advisory-specific
+replacement; repository text cannot supply one. `compatibilityGeneratedDist` is a separate false
+default for a project that commits TypeScript output under `dist/`; it requires the import opt-in
+and permits only compiler output corresponding to changed source files. See
+[`import-compatibility.md`](import-compatibility.md) for the eight-file/twenty-import limit and
+the two-App merge gate. Lakina and Evo remain dependency-only unless separately opted in.
+
 Malware advisories create or update an incident issue in the affected repository. For public
 repositories, that issue is necessarily public and contains only non-secret advisory and dependency
 facts plus the response checklist. Keep credentials and sensitive investigation details elsewhere.

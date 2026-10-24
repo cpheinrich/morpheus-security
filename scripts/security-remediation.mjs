@@ -652,7 +652,8 @@ function prepare() {
   }
 
   const ordinary = nextCandidate(findings, config, open);
-  const compatibility = ordinary ? null : nextCompatibilityCandidate(findings, loadCompatibilityMappings(), config, open);
+  const compatibility = ordinary || repo !== "cpheinrich/morpheus" ? null
+    : nextCompatibilityCandidate(findings, loadCompatibilityMappings(), config, open);
   const finding = ordinary ?? compatibility?.finding;
   if (!finding) {
     const unpatched = findings.filter((candidate) => !candidate.fixedVersion && !candidate.malicious);
@@ -703,7 +704,7 @@ function ensureSecurityLabels(repo) {
   ]) ensureLabel(repo, ...label);
 }
 
-export function requiredChecksReady(rollup, requiredChecks) {
+export function requiredChecksReady(rollup, requiredChecks, options = {}) {
   if (!Array.isArray(requiredChecks) || requiredChecks.length === 0) {
     return { ready: false, reason: "no explicit requiredChecks policy" };
   }
@@ -714,9 +715,14 @@ export function requiredChecksReady(rollup, requiredChecks) {
       check.status === "COMPLETED" && check.conclusion === "SUCCESS" && Number.isFinite(Number(check.id)))
       .map((check) => Number(check.id));
     const latestSuccessfulCheckId = successfulCheckIds.length ? Math.max(...successfulCheckIds) : null;
+    const latestActionsConventionSuccess = matches.filter((check) => check.appSlug === "github-actions" &&
+      check.status === "COMPLETED" && check.conclusion === "SUCCESS" && Number.isFinite(Number(check.id)))
+      .reduce((latest, check) => Math.max(latest, Number(check.id)), 0);
     const accepted = matches.every((check) => {
       if (check.status !== "COMPLETED") return check.state === "SUCCESS";
       if (check.conclusion === "SUCCESS") return true;
+      if (options.importReviewSuperseded === true && requiredCheck === "pr / conventions" &&
+          check.appSlug === "github-actions" && Number(check.id) < latestActionsConventionSuccess) return true;
       return ["CANCELLED", "SKIPPED", "NEUTRAL"].includes(check.conclusion) &&
         latestSuccessfulCheckId != null && Number(check.id) < latestSuccessfulCheckId;
     });
@@ -744,6 +750,7 @@ export function restCheckRollup(checkRuns, commitStatuses) {
     ...(checkRuns ?? []).map((check) => ({
       id: check.id,
       name: check.name,
+      appSlug: check.app?.slug,
       status: String(check.status ?? "").toUpperCase(),
       conclusion: check.conclusion == null ? null : String(check.conclusion).toUpperCase(),
     })),
@@ -937,6 +944,10 @@ function reconcile() {
       continue;
     }
     if (attestation.mode === "import-only-compatibility") {
+      if (repo !== "cpheinrich/morpheus") {
+        summary(`- ${pr.html_url}: import-only merge is not enabled for this repository.`);
+        continue;
+      }
       const mapping = loadCompatibilityMappings().find((entry) =>
         entry.dependency === attestation.dependency && entry.replacement === attestation.replacement &&
         [attestation.advisory, ...attestation.aliases].includes(entry.advisory));
@@ -965,7 +976,8 @@ function reconcile() {
       summary(`- ${pr.html_url}: waiting because GitHub has not resolved its merge state.`);
       continue;
     }
-    const readiness = requiredChecksReady(detail?.statusCheckRollup, config.requiredChecks);
+    const readiness = requiredChecksReady(detail?.statusCheckRollup, config.requiredChecks,
+      { importReviewSuperseded: attestation.mode === "import-only-compatibility" });
     if (!readiness.ready) {
       summary(`- ${pr.html_url}: waiting; ${readiness.reason}.`);
       continue;
