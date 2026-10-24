@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { validateImportCompatibility } from "../src/import-compatibility.js";
+import { validateGeneratedDistPaths, validateImportCompatibility } from "../src/import-compatibility.js";
 
 const oldPackage = "gray-matter";
 const newPackage = "@11ty/gray-matter";
@@ -54,5 +54,14 @@ describe("import-only security compatibility", () => {
       .toThrow("path is not allowed");
     expect(() => validateImportCompatibility([one], oldPackage, "../../unsafe"))
       .toThrow("registry package names");
+  });
+
+  it("bounds committed dist output to the exact changed TypeScript sources", () => {
+    expect(() => validateGeneratedDistPaths(["src/review/local.ts"], ["dist/review/local.js", "dist/review/local.js.map"]))
+      .not.toThrow();
+    expect(() => validateGeneratedDistPaths(["src/review/local.ts"], ["dist/check/pr.js"]))
+      .toThrow("unrelated");
+    expect(() => validateGeneratedDistPaths(["src/review/local.tsx"], []))
+      .toThrow("TypeScript source");
   });
 });

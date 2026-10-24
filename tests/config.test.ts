@@ -13,6 +13,7 @@ describe("repository compatibility opt-in", () => {
 
   it("rejects an ambiguous option or malformed existing gates", () => {
     expect(() => validateSecurityConfig({ ...base, importOnlyCompatibility: "true" })).toThrow("boolean");
+    expect(() => validateSecurityConfig({ ...base, compatibilityGeneratedDist: true })).toThrow("boolean");
     expect(() => validateSecurityConfig({ ...base, requiredChecks: [""] })).toThrow("valid holds/requiredChecks");
     expect(() => validateSecurityConfig({ ...base, incidentRepository: "other/repo" })).toThrow("valid holds/requiredChecks");
   });

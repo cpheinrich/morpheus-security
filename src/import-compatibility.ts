@@ -12,6 +12,25 @@ export interface SourceChange {
 const PACKAGE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 const SOURCE = /^(?:src|tests)\/(?!.*(?:^|\/)(?:policy|auth|credential|secret|trade|trading|order|execution)(?:[./]|$))[A-Za-z0-9._/-]+\.(?:[cm]?[jt]s|jsx|tsx)$/;
 
+export function isAllowedCompatibilitySource(path: string): boolean {
+  return SOURCE.test(path) && !path.includes("..") && !path.includes("//");
+}
+
+/** Morpheus's committed TypeScript output is a deterministic derivative, never authored text. */
+export function validateGeneratedDistPaths(sourcePaths: string[], generatedPaths: string[]): void {
+  if (sourcePaths.length < 1 || sourcePaths.length > MAX_COMPATIBILITY_SOURCE_FILES ||
+      sourcePaths.some((path) => !/^src\/[A-Za-z0-9._/-]+\.ts$/.test(path) || !isAllowedCompatibilitySource(path))) {
+    throw new Error("Generated dist requires allowed TypeScript source files");
+  }
+  const allowed = new Set(sourcePaths.flatMap((path) => {
+    const base = `dist/${path.slice(4, -3)}`;
+    return [".js", ".js.map", ".d.ts", ".d.ts.map"].map((extension) => base + extension);
+  }));
+  if (generatedPaths.some((path) => !allowed.has(path))) {
+    throw new Error("Generated dist changed a file unrelated to mapped imports");
+  }
+}
+
 function importLiteralPositions(path: string, source: string, dependency: string): Array<{ start: number; end: number }> {
   const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true);
   const positions: Array<{ start: number; end: number }> = [];
@@ -37,6 +56,19 @@ function importLiteralPositions(path: string, source: string, dependency: string
   return positions;
 }
 
+/** Construct a candidate; validation below independently compares it with the original bytes. */
+export function replaceImportSpecifiers(path: string, source: string, dependency: string, replacement: string): string {
+  if (!PACKAGE.test(dependency) || !PACKAGE.test(replacement) || dependency === replacement) {
+    throw new Error("Compatibility package names must be distinct registry package names");
+  }
+  let result = source;
+  for (const { start, end } of importLiteralPositions(path, source, dependency).reverse()) {
+    const quote = source[start];
+    result = result.slice(0, start) + quote + replacement + quote + result.slice(end);
+  }
+  return result;
+}
+
 /** Proves byte-for-byte that only approved module specifiers changed. */
 export function validateImportCompatibility(changes: SourceChange[], dependency: string, replacement: string): number {
   if (!PACKAGE.test(dependency) || !PACKAGE.test(replacement) || dependency === replacement) {
@@ -48,15 +80,11 @@ export function validateImportCompatibility(changes: SourceChange[], dependency:
   }
   let imports = 0;
   for (const change of changes) {
-    if (!SOURCE.test(change.path) || change.path.includes("..") || change.path.includes("//")) {
+    if (!isAllowedCompatibilitySource(change.path)) {
       throw new Error(`Compatibility source path is not allowed: ${change.path}`);
     }
     const positions = importLiteralPositions(change.path, change.before, dependency);
-    let expected = change.before;
-    for (const { start, end } of positions.reverse()) {
-      const literal = change.before.slice(start, end);
-      expected = expected.slice(0, start) + literal[0] + replacement + literal[0] + expected.slice(end);
-    }
+    const expected = replaceImportSpecifiers(change.path, change.before, dependency, replacement);
     if (positions.length === 0 || change.after !== expected) {
       throw new Error(`Compatibility source contains a change beyond mapped imports: ${change.path}`);
     }
