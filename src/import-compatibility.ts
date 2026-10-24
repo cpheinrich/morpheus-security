@@ -11,7 +11,7 @@ export interface SourceChange {
 
 const PACKAGE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 const SOURCE = /^(?:src|tests)\/[A-Za-z0-9._/-]+\.(?:[cm]?[jt]s|jsx|tsx)$/;
-const FORBIDDEN = /(?:^|[-_.])(?:policy|auth|authentication|credential|secret|trade|trading|order|execution)(?:[-_.]|$)/i;
+const FORBIDDEN = /(?:^|[-_.])(?:policy|auth|credential|secret|trad|order|execut|financ|broker|portfolio|position|account|payment|ledger|market)[a-z0-9_-]*(?:[-_.]|$)/i;
 
 export function isAllowedCompatibilitySource(path: string): boolean {
   return SOURCE.test(path) && !path.includes("..") && !path.includes("//") &&

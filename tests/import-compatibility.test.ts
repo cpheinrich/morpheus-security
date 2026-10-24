@@ -59,7 +59,8 @@ describe("import-only security compatibility", () => {
     expect(() => validateImportCompatibility([one, one], oldPackage, newPackage)).toThrow("distinct");
     expect(() => validateImportCompatibility([{ ...one, path: ".github/workflows/ci.yml" }], oldPackage, newPackage))
       .toThrow("path is not allowed");
-    for (const path of ["src/trading/foo.ts", "src/auth.ts", "src/credential.ts", "tests/trade.test.ts"]) {
+    for (const path of ["src/trading/foo.ts", "src/auth.ts", "src/authorization.ts", "src/credentials.ts",
+      "src/trades.ts", "src/orders.ts", "src/portfolio.ts", "src/market-data.ts", "tests/trade.test.ts"]) {
       expect(() => validateImportCompatibility([{ ...one, path }], oldPackage, newPackage)).toThrow("path is not allowed");
     }
     expect(() => validateImportCompatibility([one], oldPackage, "../../unsafe"))
