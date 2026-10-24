@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parse, parseDocument } from "yaml";
@@ -13,7 +13,7 @@ import {
   isSecurityDependencyOnly,
   SECURITY_MARKER,
 } from "../dist/policy.js";
-import { isAllowedCompatibilitySource, replaceImportSpecifiers, validateGeneratedDistPaths, validateImportCompatibility } from "../dist/import-compatibility.js";
+import { hasPackageReference, isAllowedCompatibilitySource, replaceImportSpecifiers, validateGeneratedDistPaths, validateImportCompatibility } from "../dist/import-compatibility.js";
 
 const INCIDENT_LABELS = [
   ["security-incident", "b60205", "Security incident record"],
@@ -486,9 +486,20 @@ export function applyCompatibilityReplacement(finding, mapping, config = {}) {
     generatedFiles = run("git", ["diff", "--name-only", "--", "dist"]).split("\n").filter(Boolean);
     validateGeneratedDistPaths(changes.map((change) => change.path).filter((path) => path.startsWith("src/")), generatedFiles);
   }
+  assertNoOldPackageReferences(finding.dependency);
   return { strategy: "import-only-compatibility", manifestPath: manifests.map((path) => relative(process.cwd(), path)).join(","),
     beforeLock, importFiles: changes.map((change) => change.path), importCount, generatedFiles,
     ...(config.compatibilityGeneratedDist === true ? { generatedDistDigest: generatedDistDigest() } : {}) };
+}
+
+function assertNoOldPackageReferences(dependency) {
+  for (const path of run("git", ["ls-files", "-z"]).split("\0").filter(Boolean)) {
+    if (!/\.(?:[cm]?[jt]s|jsx|tsx)$/.test(path)) continue;
+    if (!lstatSync(path).isFile()) throw new Error(`Refusing linked source while replacing ${dependency}: ${path}`);
+    if (hasPackageReference(path, readFileSync(path, "utf8"), dependency)) {
+      throw new Error(`Removed package ${dependency} remains referenced in ${path}`);
+    }
+  }
 }
 
 function applyUpdate(finding) {
@@ -794,6 +805,7 @@ export function verifiedCandidateAttestation(checkRuns, botSlug, headSha, repo) 
           typeof receipt.sourcePath === "string" && receipt.sourcePath.length > 0 &&
           (receipt.version === 1 || (receipt.mode === "import-only-compatibility" &&
             typeof receipt.replacement === "string" && Array.isArray(receipt.importFiles) &&
+            /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(receipt.replacementVersion ?? "") &&
             receipt.importFiles.length >= 1 && receipt.importFiles.length <= 8 &&
             Array.isArray(receipt.generatedFiles) && receipt.generatedFiles.length <= 32 &&
             Number.isInteger(receipt.importCount) && receipt.importCount >= 1 && receipt.importCount <= 20))) {
@@ -815,7 +827,9 @@ export function verifiedIndependentReview(comments, repo, prNumber, headSha) {
     try {
       const record = JSON.parse(marker[1]);
       if (record.version === 1 && record.repository === repo && record.pr === prNumber &&
-          record.headSha === headSha && record.verdict === "clear") return record;
+          record.headSha === headSha && ["clear", "findings", "hold"].includes(record.verdict)) {
+        return record.verdict === "clear" ? record : null;
+      }
     } catch { /* Malformed comments do not clear a candidate. */ }
   }
   return null;
@@ -831,6 +845,7 @@ function createCandidateAttestation(repo, finding, headSha, plan) {
     aliases: finding.aliases,
     sourcePath: finding.sourcePath,
     ...(plan.compatibility ? { mode: "import-only-compatibility", replacement: plan.compatibility.replacement,
+      replacementVersion: plan.compatibility.version,
       importFiles: plan.update.importFiles, importCount: plan.update.importCount,
       generatedFiles: plan.update.generatedFiles } : {}),
   });
@@ -950,6 +965,7 @@ function reconcile() {
       }
       const mapping = loadCompatibilityMappings().find((entry) =>
         entry.dependency === attestation.dependency && entry.replacement === attestation.replacement &&
+        entry.version === attestation.replacementVersion &&
         [attestation.advisory, ...attestation.aliases].includes(entry.advisory));
       if (!config.importOnlyCompatibility || !mapping) {
         summary(`- ${pr.html_url}: not merged because the import-only opt-in or reviewed mapping is absent.`);

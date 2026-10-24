@@ -10,10 +10,12 @@ export interface SourceChange {
 }
 
 const PACKAGE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
-const SOURCE = /^(?:src|tests)\/(?!.*(?:^|\/)(?:policy|auth|credential|secret|trade|trading|order|execution)(?:[./]|$))[A-Za-z0-9._/-]+\.(?:[cm]?[jt]s|jsx|tsx)$/;
+const SOURCE = /^(?:src|tests)\/[A-Za-z0-9._/-]+\.(?:[cm]?[jt]s|jsx|tsx)$/;
+const FORBIDDEN = /(?:^|[-_.])(?:policy|auth|authentication|credential|secret|trade|trading|order|execution)(?:[-_.]|$)/i;
 
 export function isAllowedCompatibilitySource(path: string): boolean {
-  return SOURCE.test(path) && !path.includes("..") && !path.includes("//");
+  return SOURCE.test(path) && !path.includes("..") && !path.includes("//") &&
+    !path.split("/").slice(1).some((part) => FORBIDDEN.test(part));
 }
 
 /** Morpheus's committed TypeScript output is a deterministic derivative, never authored text. */
@@ -28,6 +30,9 @@ export function validateGeneratedDistPaths(sourcePaths: string[], generatedPaths
   }));
   if (generatedPaths.some((path) => !allowed.has(path))) {
     throw new Error("Generated dist changed a file unrelated to mapped imports");
+  }
+  if (sourcePaths.some((path) => !generatedPaths.includes(`dist/${path.slice(4, -3)}.js`))) {
+    throw new Error("Generated dist is missing emitted JavaScript for a changed source");
   }
 }
 
@@ -67,6 +72,19 @@ export function replaceImportSpecifiers(path: string, source: string, dependency
     result = result.slice(0, start) + quote + replacement + quote + result.slice(end);
   }
   return result;
+}
+
+/** Any remaining runtime or test reference to the removed package blocks attestation. */
+export function hasPackageReference(path: string, source: string, dependency: string): boolean {
+  const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true);
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+        (node.text === dependency || node.text.startsWith(`${dependency}/`))) found = true;
+    if (!found) ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return found;
 }
 
 /** Proves byte-for-byte that only approved module specifiers changed. */

@@ -46,5 +46,8 @@ describe("independent Manager App review receipt", () => {
     expect(verifiedIndependentReview([{ ...comment, performed_via_github_app: null }], repo, 42, head)).toBeNull();
     expect(verifiedIndependentReview([{ ...comment, user: { login: "cpheinrich" } }], repo, 42, head)).toBeNull();
     expect(verifiedIndependentReview([{ ...comment, body: body.replace('"clear"', '"findings"') }], repo, 42, head)).toBeNull();
+    expect(verifiedIndependentReview([comment, { ...comment, body: body.replace('"clear"', '"findings"') }], repo, 42, head)).toBeNull();
+    expect(verifiedIndependentReview([{ ...comment, body: body.replace('"clear"', '"findings"') }, comment], repo, 42, head))
+      .toEqual(expect.objectContaining({ headSha: head }));
   });
 });

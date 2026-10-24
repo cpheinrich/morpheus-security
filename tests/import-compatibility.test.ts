@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { validateGeneratedDistPaths, validateImportCompatibility } from "../src/import-compatibility.js";
+import { hasPackageReference, validateGeneratedDistPaths, validateImportCompatibility } from "../src/import-compatibility.js";
 
 const oldPackage = "gray-matter";
 const newPackage = "@11ty/gray-matter";
@@ -35,6 +35,13 @@ describe("import-only security compatibility", () => {
     }
   });
 
+  it("detects old-package references left in dynamic imports or excluded source", () => {
+    expect(hasPackageReference("src/parser.ts", "const x = import('gray-matter');", oldPackage)).toBe(true);
+    expect(hasPackageReference("src/auth.ts", "const x = require('gray-matter');", oldPackage)).toBe(true);
+    expect(hasPackageReference("dist/parser.js", "import x from 'gray-matter/subpath';", oldPackage)).toBe(true);
+    expect(hasPackageReference("src/parser.ts", "// gray-matter\nimport x from '@11ty/gray-matter';", oldPackage)).toBe(false);
+  });
+
   it("enforces eight source files and twenty imports at the boundary", () => {
     const one = change("import x from 'gray-matter';\n", "import x from '@11ty/gray-matter';\n")[0]!;
     const eight = Array.from({ length: 8 }, (_, index) => ({ ...one, path: `src/parser${index}.ts` }));
@@ -52,6 +59,9 @@ describe("import-only security compatibility", () => {
     expect(() => validateImportCompatibility([one, one], oldPackage, newPackage)).toThrow("distinct");
     expect(() => validateImportCompatibility([{ ...one, path: ".github/workflows/ci.yml" }], oldPackage, newPackage))
       .toThrow("path is not allowed");
+    for (const path of ["src/trading/foo.ts", "src/auth.ts", "src/credential.ts", "tests/trade.test.ts"]) {
+      expect(() => validateImportCompatibility([{ ...one, path }], oldPackage, newPackage)).toThrow("path is not allowed");
+    }
     expect(() => validateImportCompatibility([one], oldPackage, "../../unsafe"))
       .toThrow("registry package names");
   });
@@ -61,6 +71,8 @@ describe("import-only security compatibility", () => {
       .not.toThrow();
     expect(() => validateGeneratedDistPaths(["src/review/local.ts"], ["dist/check/pr.js"]))
       .toThrow("unrelated");
+    expect(() => validateGeneratedDistPaths(["src/review/local.ts"], []))
+      .toThrow("missing emitted JavaScript");
     expect(() => validateGeneratedDistPaths(["src/review/local.tsx"], []))
       .toThrow("TypeScript source");
   });
