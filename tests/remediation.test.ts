@@ -464,6 +464,24 @@ describe("security remediation inputs", () => {
       .toEqual(expect.objectContaining({ ready: false }));
   });
 
+  it("accepts only an older GitHub Actions conventions failure superseded by the reviewed import check", () => {
+    const checks = restCheckRollup([
+      { id: 10, name: "pr / conventions", app: { slug: "github-actions" }, status: "completed", conclusion: "failure" },
+      { id: 11, name: "pr / conventions", app: { slug: "github-actions" }, status: "completed", conclusion: "success" },
+    ], []);
+    expect(requiredChecksReady(checks, ["pr / conventions"])).toEqual(expect.objectContaining({ ready: false }));
+    expect(requiredChecksReady(checks, ["pr / conventions"], { importReviewSuperseded: true }))
+      .toEqual(expect.objectContaining({ ready: true }));
+    expect(requiredChecksReady([
+      { ...checks[0], appSlug: "other-app" }, checks[1],
+    ], ["pr / conventions"], { importReviewSuperseded: true }))
+      .toEqual(expect.objectContaining({ ready: false }));
+    expect(requiredChecksReady([
+      checks[1], { ...checks[0], id: 12 },
+    ], ["pr / conventions"], { importReviewSuperseded: true }))
+      .toEqual(expect.objectContaining({ ready: false }));
+  });
+
   it("does not ignore a cancellation newer than the matching success", () => {
     const rollup = restCheckRollup([
       { id: 10, name: "test", app: { id: 1 }, check_suite: { id: 100 }, status: "completed", conclusion: "success" },

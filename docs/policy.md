@@ -50,6 +50,15 @@ requires every explicitly configured `requiredChecks` entry to have passed, and 
 the merge to that head. An empty check list disables automatic merging. Branch protection and
 review rules remain additional authority. Human-authored PRs never receive the bot waiver.
 
+The optional import-only compatibility lane is limited to reviewed advisory-to-replacement
+mappings for direct npm or pnpm dependencies. Its candidate attestation names the exact head,
+replacement, import files and count. It can change at most eight `src/` or `tests/` files and
+twenty mapped import literals; all other source bytes must match. Generated `dist/` is separately
+opted in and must be deterministic compiler output for those sources. The Security App does not
+merge this lane until a different Manager App posts a clear independent review for that exact
+head, the current repository opt-in and mapping remain, all explicit checks pass, and GitHub
+branch protection accepts the merge. A label or PR prose is never review provenance.
+
 If the default branch advances and strict protection makes a validated candidate stale, the next
 run closes that bot PR and recreates it from current default-branch state under a new branch. The
 replacement must repeat registry validation, OSV rescan, App attestation, and every configured

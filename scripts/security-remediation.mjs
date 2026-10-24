@@ -1,15 +1,19 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parse, parseDocument } from "yaml";
+import { validateSecurityConfig } from "./config.mjs";
+import { compatibilityMappingFor, loadCompatibilityMappings } from "./compatibility-mappings.mjs";
 import {
   findingKey,
   findingsFromOsvJson,
   isSecurityDependencyOnly,
   SECURITY_MARKER,
 } from "../dist/policy.js";
+import { hasPackageReference, isAllowedCompatibilitySource, replaceImportSpecifiers, validateGeneratedDistPaths, validateImportCompatibility } from "../dist/import-compatibility.js";
 
 const INCIDENT_LABELS = [
   ["security-incident", "b60205", "Security incident record"],
@@ -36,6 +40,10 @@ function run(file, args, options = {}) {
     stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
     ...options,
   }).trim();
+}
+
+function generatedDistDigest() {
+  return createHash("sha256").update(execFileSync("git", ["diff", "--binary", "--", "dist"])).digest("hex");
 }
 
 function packageManagerEnvironment() {
@@ -77,13 +85,7 @@ function loadConfig() {
   const path = process.env.SECURITY_CONFIG ?? ".github/morpheus-security.json";
   if (!existsSync(path)) throw new Error(`Required opt-in policy is missing: ${path}`);
   const config = JSON.parse(readFileSync(path, "utf8"));
-  if (config?.version !== 1 || !Array.isArray(config.holds) ||
-      !Array.isArray(config.requiredChecks) ||
-      !config.requiredChecks.every((name) => typeof name === "string" && name.trim() === name && name.length > 0) ||
-      config.incidentRepository != null) {
-    throw new Error("Security config must explicitly define version 1 and valid holds/requiredChecks arrays");
-  }
-  return config;
+  return validateSecurityConfig(config);
 }
 
 function dependabotFindings(repo) {
@@ -130,6 +132,19 @@ function openSecurityPulls(repo) {
 function held(finding, config) {
   return config.holds.find((hold) => hold.dependency === finding.dependency &&
     (!hold.advisory || finding.aliases.includes(hold.advisory)));
+}
+
+export function nextCompatibilityCandidate(findings, mappings, config, open) {
+  if (config.importOnlyCompatibility !== true) return null;
+  const openLockfiles = new Set(open.map((pr) => /Lockfile: `([^`]+)`/.exec(pr.body ?? "")?.[1]).filter(Boolean));
+  for (const finding of findings) {
+    const mapping = compatibilityMappingFor(finding, mappings);
+    if (!mapping || held(finding, config) || openLockfiles.has(finding.sourcePath) ||
+        open.some((pr) => String(pr.body ?? "").includes(`Dependency: \`${finding.dependency}\``))) continue;
+    if (!["pnpm-lock.yaml", "package-lock.json"].includes(basename(finding.sourcePath))) continue;
+    return { finding, mapping };
+  }
+  return null;
 }
 
 export function nextCandidate(findings, config, open) {
@@ -405,6 +420,88 @@ export function updatePnpm(finding) {
   return { strategy: "pnpm-transitive-override", manifestPath, beforeLock };
 }
 
+function replaceDirectDependency(manifestPath, dependency, replacement, version) {
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  let replaced = false;
+  for (const group of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+    if (!Object.hasOwn(manifest[group] ?? {}, dependency)) continue;
+    if (Object.hasOwn(manifest[group], replacement)) {
+      throw new Error(`Replacement ${replacement} already exists in ${manifestPath}`);
+    }
+    delete manifest[group][dependency];
+    manifest[group][replacement] = version;
+    replaced = true;
+  }
+  if (replaced) writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  return replaced;
+}
+
+/** A mapping can only replace a direct npm/pnpm dependency and its import literals. */
+export function applyCompatibilityReplacement(finding, mapping, config = {}) {
+  const root = packageRoot(finding.sourcePath);
+  assertOfficialNpmConfiguration(root);
+  const beforeLock = readFileSync(finding.sourcePath, "utf8");
+  const lock = basename(finding.sourcePath);
+  const workspaceArgs = existsSync(join(root, "pnpm-workspace.yaml")) ? [] : ["--ignore-workspace"];
+  const manifests = lock === "pnpm-lock.yaml"
+    ? pnpmDirectManifests(finding.sourcePath, finding.dependency).map((entry) => entry.manifestPath)
+    : [join(root, "package.json")];
+  let replaced = 0;
+  for (const path of manifests) replaced += Number(replaceDirectDependency(path, finding.dependency, mapping.replacement, mapping.version));
+  if (replaced === 0) {
+    throw new Error(`No direct ${finding.dependency} dependency is eligible for import compatibility`);
+  }
+  const registry = registryArgs(mapping.replacement);
+  if (lock === "pnpm-lock.yaml") {
+    packageRun("pnpm", ["install", "--lockfile-only", "--ignore-scripts", ...workspaceArgs, ...registry], { cwd: root });
+  } else if (lock === "package-lock.json") {
+    packageRun("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registry], { cwd: root });
+  } else throw new Error(`Unsupported compatibility lockfile: ${lock}`);
+
+  const changes = [];
+  for (const path of run("git", ["ls-files", "-z", "--", "src", "tests"]).split("\0").filter(Boolean)) {
+    if (!isAllowedCompatibilitySource(path)) continue;
+    const before = readFileSync(path, "utf8");
+    const after = replaceImportSpecifiers(path, before, finding.dependency, mapping.replacement);
+    if (after === before) continue;
+    changes.push({ path, before, after });
+  }
+  const importCount = validateImportCompatibility(changes, finding.dependency, mapping.replacement);
+  for (const change of changes) writeFileSync(change.path, change.after);
+  let generatedFiles = [];
+  if (config.compatibilityGeneratedDist === true) {
+    if (root !== process.cwd() || !existsSync("tsconfig.build.json") ||
+        run("git", ["ls-files", "--", "dist"]).length === 0) {
+      throw new Error("Committed generated dist requires a root TypeScript build and tracked dist files");
+    }
+    if (lock === "pnpm-lock.yaml") {
+      packageRun("pnpm", ["install", "--frozen-lockfile", "--ignore-scripts", ...registry], { cwd: root });
+    } else {
+      packageRun("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund", ...registry], { cwd: root });
+    }
+    packageRun("pnpm", ["exec", "tsc", "-p", "tsconfig.build.json"], { cwd: root });
+    if (run("git", ["ls-files", "--others", "--exclude-standard", "--", "dist"])) {
+      throw new Error("TypeScript build created untracked dist files");
+    }
+    generatedFiles = run("git", ["diff", "--name-only", "--", "dist"]).split("\n").filter(Boolean);
+    validateGeneratedDistPaths(changes.map((change) => change.path).filter((path) => path.startsWith("src/")), generatedFiles);
+  }
+  assertNoOldPackageReferences(finding.dependency);
+  return { strategy: "import-only-compatibility", manifestPath: manifests.map((path) => relative(process.cwd(), path)).join(","),
+    beforeLock, importFiles: changes.map((change) => change.path), importCount, generatedFiles,
+    ...(config.compatibilityGeneratedDist === true ? { generatedDistDigest: generatedDistDigest() } : {}) };
+}
+
+function assertNoOldPackageReferences(dependency) {
+  for (const path of run("git", ["ls-files", "-z"]).split("\0").filter(Boolean)) {
+    if (!/\.(?:[cm]?[jt]s|jsx|tsx)$/.test(path)) continue;
+    if (!lstatSync(path).isFile()) throw new Error(`Refusing linked source while replacing ${dependency}: ${path}`);
+    if (hasPackageReference(path, readFileSync(path, "utf8"), dependency)) {
+      throw new Error(`Removed package ${dependency} remains referenced in ${path}`);
+    }
+  }
+}
+
 function applyUpdate(finding) {
   const base = basename(finding.sourcePath);
   if (base === "package-lock.json") return updateNpm(finding);
@@ -565,7 +662,10 @@ function prepare() {
     finding.incidentUrl = upsertMalwareIncident(repo, finding, findings);
   }
 
-  const finding = nextCandidate(findings, config, open);
+  const ordinary = nextCandidate(findings, config, open);
+  const compatibility = ordinary || repo !== "cpheinrich/morpheus" ? null
+    : nextCompatibilityCandidate(findings, loadCompatibilityMappings(), config, open);
+  const finding = ordinary ?? compatibility?.finding;
   if (!finding) {
     const unpatched = findings.filter((candidate) => !candidate.fixedVersion && !candidate.malicious);
     writeFileSync(planFile, JSON.stringify({ status: findings.length ? "waiting" : "clean", findings, unpatched, open: open.map((pr) => pr.html_url) }, null, 2));
@@ -576,9 +676,17 @@ function prepare() {
 
   const beforeLock = ["package-lock.json", "pnpm-lock.yaml"].includes(basename(finding.sourcePath))
     ? readFileSync(finding.sourcePath, "utf8") : null;
-  const { update, updates } = applyAffectedUpdates(findings, finding);
+  const { update, updates } = compatibility
+    ? { update: applyCompatibilityReplacement(finding, compatibility.mapping, config), updates: [] }
+    : applyAffectedUpdates(findings, finding);
   const changedFiles = run("git", ["diff", "--name-only"]).split("\n").filter(Boolean);
-  if (!isSecurityDependencyOnly(changedFiles)) throw new Error(`Updater changed a disallowed path: ${changedFiles.join(", ")}`);
+  const importFiles = compatibility ? update.importFiles : [];
+  const generatedFiles = compatibility ? update.generatedFiles : [];
+  if (!isSecurityDependencyOnly(changedFiles.filter((path) => !importFiles.includes(path) && !generatedFiles.includes(path))) ||
+      (compatibility && (![...importFiles, ...generatedFiles].every((path) => changedFiles.includes(path)) ||
+        (generatedFiles.length > 0 && !config.compatibilityGeneratedDist)))) {
+    throw new Error(`Updater changed a disallowed path: ${changedFiles.join(", ")}`);
+  }
   if (!changedFiles.includes(finding.sourcePath)) throw new Error(`Updater did not change ${finding.sourcePath}`);
   if (beforeLock && basename(finding.sourcePath) === "package-lock.json") {
     assertOfficialNpmArtifacts(finding.sourcePath, beforeLock);
@@ -590,7 +698,8 @@ function prepare() {
     assertOfficialUvArtifacts(finding.sourcePath, update.beforeLock);
     delete update.beforeLock;
   }
-  const plan = { status: "prepared", finding, update, updates, changedFiles, beforeSha: run("git", ["rev-parse", "HEAD"]) };
+  const plan = { status: "prepared", finding, update, updates, changedFiles,
+    ...(compatibility ? { compatibility: compatibility.mapping } : {}), beforeSha: run("git", ["rev-parse", "HEAD"]) };
   mkdirSync(dirname(planFile), { recursive: true });
   writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
   output("changed", "true");
@@ -606,7 +715,7 @@ function ensureSecurityLabels(repo) {
   ]) ensureLabel(repo, ...label);
 }
 
-export function requiredChecksReady(rollup, requiredChecks) {
+export function requiredChecksReady(rollup, requiredChecks, options = {}) {
   if (!Array.isArray(requiredChecks) || requiredChecks.length === 0) {
     return { ready: false, reason: "no explicit requiredChecks policy" };
   }
@@ -617,9 +726,14 @@ export function requiredChecksReady(rollup, requiredChecks) {
       check.status === "COMPLETED" && check.conclusion === "SUCCESS" && Number.isFinite(Number(check.id)))
       .map((check) => Number(check.id));
     const latestSuccessfulCheckId = successfulCheckIds.length ? Math.max(...successfulCheckIds) : null;
+    const latestActionsConventionSuccess = matches.filter((check) => check.appSlug === "github-actions" &&
+      check.status === "COMPLETED" && check.conclusion === "SUCCESS" && Number.isFinite(Number(check.id)))
+      .reduce((latest, check) => Math.max(latest, Number(check.id)), 0);
     const accepted = matches.every((check) => {
       if (check.status !== "COMPLETED") return check.state === "SUCCESS";
       if (check.conclusion === "SUCCESS") return true;
+      if (options.importReviewSuperseded === true && requiredCheck === "pr / conventions" &&
+          check.appSlug === "github-actions" && Number(check.id) < latestActionsConventionSuccess) return true;
       return ["CANCELLED", "SKIPPED", "NEUTRAL"].includes(check.conclusion) &&
         latestSuccessfulCheckId != null && Number(check.id) < latestSuccessfulCheckId;
     });
@@ -647,6 +761,7 @@ export function restCheckRollup(checkRuns, commitStatuses) {
     ...(checkRuns ?? []).map((check) => ({
       id: check.id,
       name: check.name,
+      appSlug: check.app?.slug,
       status: String(check.status ?? "").toUpperCase(),
       conclusion: check.conclusion == null ? null : String(check.conclusion).toUpperCase(),
     })),
@@ -683,11 +798,17 @@ export function verifiedCandidateAttestation(checkRuns, botSlug, headSha, repo) 
   for (const check of candidates.sort((left, right) => Number(right.id ?? 0) - Number(left.id ?? 0))) {
     try {
       const receipt = JSON.parse(check.output?.summary ?? "");
-      if (receipt.version === 1 && receipt.repository === repo && receipt.headSha === headSha &&
+      if ([1, 2].includes(receipt.version) && receipt.repository === repo && receipt.headSha === headSha &&
           typeof receipt.dependency === "string" && receipt.dependency.length > 0 &&
           typeof receipt.advisory === "string" && Array.isArray(receipt.aliases) &&
           receipt.aliases.every((alias) => typeof alias === "string") &&
-          typeof receipt.sourcePath === "string" && receipt.sourcePath.length > 0) {
+          typeof receipt.sourcePath === "string" && receipt.sourcePath.length > 0 &&
+          (receipt.version === 1 || (receipt.mode === "import-only-compatibility" &&
+            typeof receipt.replacement === "string" && Array.isArray(receipt.importFiles) &&
+            /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(receipt.replacementVersion ?? "") &&
+            receipt.importFiles.length >= 1 && receipt.importFiles.length <= 8 &&
+            Array.isArray(receipt.generatedFiles) && receipt.generatedFiles.length <= 32 &&
+            Number.isInteger(receipt.importCount) && receipt.importCount >= 1 && receipt.importCount <= 20))) {
         return receipt;
       }
     } catch {
@@ -697,15 +818,36 @@ export function verifiedCandidateAttestation(checkRuns, botSlug, headSha, repo) 
   return null;
 }
 
-function createCandidateAttestation(repo, finding, headSha) {
+export function verifiedIndependentReview(comments, repo, prNumber, headSha) {
+  for (const comment of [...(comments ?? [])].reverse()) {
+    if (comment.user?.login !== "morpheus-gh-manager[bot]" ||
+        comment.performed_via_github_app?.slug !== "morpheus-gh-manager") continue;
+    const marker = /^<!-- morpheus-security-review (\{[^\n]*\}) -->$/m.exec(comment.body ?? "");
+    if (!marker) continue;
+    try {
+      const record = JSON.parse(marker[1]);
+      if (record.version === 1 && record.repository === repo && record.pr === prNumber &&
+          record.headSha === headSha && ["clear", "findings", "hold"].includes(record.verdict)) {
+        return record.verdict === "clear" ? record : null;
+      }
+    } catch { /* Malformed comments do not clear a candidate. */ }
+  }
+  return null;
+}
+
+function createCandidateAttestation(repo, finding, headSha, plan) {
   const receipt = JSON.stringify({
-    version: 1,
+    version: plan.compatibility ? 2 : 1,
     repository: repo,
     headSha,
     dependency: finding.dependency,
     advisory: finding.advisory,
     aliases: finding.aliases,
     sourcePath: finding.sourcePath,
+    ...(plan.compatibility ? { mode: "import-only-compatibility", replacement: plan.compatibility.replacement,
+      replacementVersion: plan.compatibility.version,
+      importFiles: plan.update.importFiles, importCount: plan.update.importCount,
+      generatedFiles: plan.update.generatedFiles } : {}),
   });
   gh(["api", "--method", "POST", `repos/${repo}/check-runs`,
     "-f", `name=${CANDIDATE_CHECK}`,
@@ -729,9 +871,28 @@ function deliver() {
   if (remains) throw new Error(`${finding.advisory} remains after the candidate update`);
 
   const changedFiles = run("git", ["diff", "--name-only"]).split("\n").filter(Boolean);
+  const importFiles = plan.compatibility ? plan.update.importFiles : [];
+  const generatedFiles = plan.compatibility ? plan.update.generatedFiles : [];
   if (JSON.stringify(changedFiles.sort()) !== JSON.stringify([...plan.changedFiles].sort()) ||
-      !isSecurityDependencyOnly(changedFiles)) {
+      !isSecurityDependencyOnly(changedFiles.filter((path) => !importFiles.includes(path) && !generatedFiles.includes(path))) ||
+      (plan.compatibility && (!loadConfig().importOnlyCompatibility ||
+        ![...importFiles, ...generatedFiles].every((path) => changedFiles.includes(path))))) {
     throw new Error("Candidate diff changed between preparation and delivery");
+  }
+  if (plan.compatibility) {
+    if (generatedFiles.length > 0) {
+      if (!loadConfig().compatibilityGeneratedDist) throw new Error("Generated dist opt-in was removed");
+      validateGeneratedDistPaths(importFiles.filter((path) => path.startsWith("src/")), generatedFiles);
+      if (generatedDistDigest() !== plan.update.generatedDistDigest) throw new Error("Generated dist changed after preparation");
+    }
+    const changes = importFiles.map((path) => ({
+      path,
+      before: execFileSync("git", ["show", `${plan.beforeSha}:${path}`], { encoding: "utf8" }),
+      after: readFileSync(path, "utf8"),
+    }));
+    if (validateImportCompatibility(changes, finding.dependency, plan.compatibility.replacement) !== plan.update.importCount) {
+      throw new Error("Import compatibility proof changed after preparation");
+    }
   }
   if (process.env.DRY_RUN === "true") {
     summary(`## Security remediation dry run\n\nValidated ${finding.dependency}: scoped diff, official artifacts, and clean candidate rescan.`);
@@ -747,7 +908,7 @@ function deliver() {
   const candidateHead = run("git", ["rev-parse", "HEAD"]);
   run("gh", ["auth", "setup-git"]);
   run("git", ["push", "--set-upstream", "origin", branch]);
-  createCandidateAttestation(repo, finding, candidateHead);
+  createCandidateAttestation(repo, finding, candidateHead, plan);
   ensureSecurityLabels(repo);
   const incident = finding.incidentUrl ? `\nRelated incident: ${finding.incidentUrl}` : "";
   const updateLines = (plan.updates ?? [{ version: finding.version, fixedVersion: finding.fixedVersion, strategy: plan.update.strategy }])
@@ -757,7 +918,7 @@ function deliver() {
     `Dependency: \`${finding.dependency}\`\n\nLockfile: \`${finding.sourcePath}\`\n\n` +
     `Advisories: ${finding.aliases.map((alias) => `\`${alias}\``).join(", ")}\n\n` +
     `- Remediate ${finding.advisory} (${finding.aliases.join(", ")}).\n` +
-    `${updateLines}\n` +
+    `${plan.compatibility ? `- Replace direct \`${finding.dependency}\` with exact registry release \`${plan.compatibility.replacement}@${plan.compatibility.version}\`; only ${plan.update.importCount} import literals in ${plan.update.importFiles.length} source files changed.\n` : `${updateLines}\n`}` +
     `- OSV rescanned the candidate and no longer reports this package/advisory pair.\n` +
     `- Registry URLs and lockfile integrity hashes passed the deterministic supply-chain gate.\n` +
     `- Candidate head: \`${candidateHead}\`.${incident}\n\n` +
@@ -797,6 +958,25 @@ function reconcile() {
       summary(`- ${pr.html_url}: not merged because no valid App-owned candidate attestation covers its head.`);
       continue;
     }
+    if (attestation.mode === "import-only-compatibility") {
+      if (repo !== "cpheinrich/morpheus") {
+        summary(`- ${pr.html_url}: import-only merge is not enabled for this repository.`);
+        continue;
+      }
+      const mapping = loadCompatibilityMappings().find((entry) =>
+        entry.dependency === attestation.dependency && entry.replacement === attestation.replacement &&
+        entry.version === attestation.replacementVersion &&
+        [attestation.advisory, ...attestation.aliases].includes(entry.advisory));
+      if (!config.importOnlyCompatibility || !mapping) {
+        summary(`- ${pr.html_url}: not merged because the import-only opt-in or reviewed mapping is absent.`);
+        continue;
+      }
+      const pages = gh(["api", "--paginate", "--slurp", `repos/${repo}/issues/${pr.number}/comments?per_page=100`]);
+      if (!verifiedIndependentReview((pages ?? []).flatMap((page) => page), repo, pr.number, headSha)) {
+        summary(`- ${pr.html_url}: waiting for a separate Manager App review of this exact head.`);
+        continue;
+      }
+    }
     if (held({ dependency: attestation.dependency, aliases: attestation.aliases }, config)) {
       summary(`- ${pr.html_url}: not merged because of the current project hold.`);
       continue;
@@ -812,7 +992,8 @@ function reconcile() {
       summary(`- ${pr.html_url}: waiting because GitHub has not resolved its merge state.`);
       continue;
     }
-    const readiness = requiredChecksReady(detail?.statusCheckRollup, config.requiredChecks);
+    const readiness = requiredChecksReady(detail?.statusCheckRollup, config.requiredChecks,
+      { importReviewSuperseded: attestation.mode === "import-only-compatibility" });
     if (!readiness.ready) {
       summary(`- ${pr.html_url}: waiting; ${readiness.reason}.`);
       continue;
