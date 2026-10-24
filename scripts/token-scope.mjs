@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { validateSecurityConfig } from "./config.mjs";
 
 const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const NAME = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}$/;
@@ -18,13 +19,10 @@ export function validateTargetScope(config, targetRepository, targetOwner, targe
   if (target.owner !== targetOwner || target.name !== targetName) {
     throw new Error("Target owner/name inputs do not match TARGET_REPOSITORY");
   }
-  if (config?.version !== 1 || !Array.isArray(config.holds) || !Array.isArray(config.requiredChecks) ||
-      !config.requiredChecks.every((name) => typeof name === "string" && name.trim() === name && name.length > 0)) {
-    throw new Error("Security config must explicitly define version 1 and valid holds/requiredChecks arrays");
-  }
   if (config.incidentRepository != null) {
     throw new Error("incidentRepository routing is unsupported; incidents are filed in the target repository");
   }
+  validateSecurityConfig(config);
   return { target: target.repository };
 }
 

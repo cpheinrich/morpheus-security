@@ -2,6 +2,7 @@
 import { createSign } from "node:crypto";
 import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { validateSecurityConfig } from "./config.mjs";
 
 const API = "https://api.github.com";
 const CONFIG_PATH = ".github/morpheus-security.json";
@@ -41,12 +42,8 @@ async function request(fetchImpl, path, token, options = {}) {
 }
 
 function validateConfig(config, approved) {
-  if (config?.version !== 1 || !Array.isArray(config.holds) ||
-      !Array.isArray(config.requiredChecks) ||
-      !config.requiredChecks.every((name) => typeof name === "string" && name.trim() === name && name.length > 0) ||
-      config.incidentRepository != null) {
-    throw new Error(`${approved.repository} has an invalid or unapproved ${CONFIG_PATH}`);
-  }
+  try { validateSecurityConfig(config); }
+  catch { throw new Error(`${approved.repository} has an invalid or unapproved ${CONFIG_PATH}`); }
 }
 
 export function approvedRepositories(path = APPROVED_PATH) {

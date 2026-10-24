@@ -4,6 +4,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, write
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parse, parseDocument } from "yaml";
+import { validateSecurityConfig } from "./config.mjs";
 import {
   findingKey,
   findingsFromOsvJson,
@@ -77,13 +78,7 @@ function loadConfig() {
   const path = process.env.SECURITY_CONFIG ?? ".github/morpheus-security.json";
   if (!existsSync(path)) throw new Error(`Required opt-in policy is missing: ${path}`);
   const config = JSON.parse(readFileSync(path, "utf8"));
-  if (config?.version !== 1 || !Array.isArray(config.holds) ||
-      !Array.isArray(config.requiredChecks) ||
-      !config.requiredChecks.every((name) => typeof name === "string" && name.trim() === name && name.length > 0) ||
-      config.incidentRepository != null) {
-    throw new Error("Security config must explicitly define version 1 and valid holds/requiredChecks arrays");
-  }
-  return config;
+  return validateSecurityConfig(config);
 }
 
 function dependabotFindings(repo) {
