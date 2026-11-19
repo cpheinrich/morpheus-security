@@ -5,11 +5,11 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdir
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
+import semver from "semver";
 import { parse, parseDocument } from "yaml";
 import { validateSecurityConfig } from "./config.mjs";
 import { compatibilityMappingFor, loadCompatibilityMappings } from "./compatibility-mappings.mjs";
 import {
-  compareVersions,
   findingKey,
   findingsFromOsvJson,
   isSecurityDependencyOnly,
@@ -250,12 +250,16 @@ function registryArgs(dependency) {
   return ["--registry=https://registry.npmjs.org/", ...(scope ? [`--${scope}:registry=https://registry.npmjs.org/`] : [])];
 }
 
-function installedNpmVersions(lockfile, dependency) {
+function installedNpmResolutions(lockfile, dependency) {
   const lock = JSON.parse(readFileSync(lockfile, "utf8"));
-  const suffix = `/node_modules/${dependency}`;
-  const matches = Object.entries(lock.packages ?? {}).filter(([path]) =>
-    path === `node_modules/${dependency}` || path.endsWith(suffix));
-  return [...new Set(matches.map(([, entry]) => entry.version).filter(Boolean))];
+  const suffix = `node_modules/${dependency}`;
+  return new Map(Object.entries(lock.packages ?? {}).filter(([path, entry]) =>
+    (path === suffix || path.endsWith(`/${suffix}`)) && typeof entry.version === "string")
+    .map(([path, entry]) => [path, entry.version]));
+}
+
+function installedNpmVersions(lockfile, dependency) {
+  return [...new Set(installedNpmResolutions(lockfile, dependency).values())];
 }
 
 function installedNpmVersion(lockfile, dependency) {
@@ -263,17 +267,38 @@ function installedNpmVersion(lockfile, dependency) {
   return versions.length === 1 ? versions[0] : null;
 }
 
-function npmReachedFixedVersion(finding, beforeVersions, afterVersions) {
-  const meetsFloor = (version) => compareVersions(version, finding.fixedVersion) >= 0;
-  return !afterVersions.includes(finding.version) && afterVersions.some(meetsFloor) &&
-    afterVersions.every((version) => beforeVersions.includes(version) || meetsFloor(version));
+function npmResolutionAtPath(resolutions, path, dependency) {
+  const suffix = `node_modules/${dependency}`;
+  let parent = path.slice(0, -suffix.length);
+  // npm can deduplicate a nested occurrence to an ancestor's node_modules.
+  while (parent) {
+    const version = resolutions.get(`${parent}${suffix}`);
+    if (version) return version;
+    parent = parent.slice(0, parent.lastIndexOf("/", parent.length - 2) + 1);
+  }
+  return resolutions.get(suffix);
 }
 
-function tryCompatibleNpmUpdate(finding, manifestPath, originalManifest, beforeVersions, runLockCommand) {
+function npmReachedFixedVersion(finding, affected, before, after) {
+  const floors = new Map(affected.map((entry) => [entry.version, entry.fixedVersion]));
+  if ([...after.values()].includes(finding.version)) return false;
+  let selectedWasPresent = false;
+  for (const [path, installed] of before) {
+    const minimum = floors.get(installed);
+    if (!minimum) continue;
+    const resolved = npmResolutionAtPath(after, path, finding.dependency);
+    if (installed === finding.version) selectedWasPresent = true;
+    else if (resolved === installed) continue; // A later iteration handles this unchanged affected line.
+    if (!semver.valid(resolved) || !semver.valid(minimum) || !semver.gte(resolved, minimum)) return false;
+  }
+  return selectedWasPresent;
+}
+
+function tryCompatibleNpmUpdate(finding, affected, manifestPath, originalManifest, before, runLockCommand) {
   const originalLock = readFileSync(finding.sourcePath);
   try {
     runLockCommand("update", finding.dependency);
-    if (npmReachedFixedVersion(finding, beforeVersions, installedNpmVersions(finding.sourcePath, finding.dependency))) {
+    if (npmReachedFixedVersion(finding, affected, before, installedNpmResolutions(finding.sourcePath, finding.dependency))) {
       return true;
     }
   } catch (error) {
@@ -286,7 +311,7 @@ function tryCompatibleNpmUpdate(finding, manifestPath, originalManifest, beforeV
   return false;
 }
 
-export function updateNpm(finding, runNpm = packageRun) {
+export function updateNpm(finding, runNpm = packageRun, affected = [finding]) {
   const root = packageRoot(finding.sourcePath);
   assertOfficialNpmConfiguration(root);
   const manifestPath = join(root, "package.json");
@@ -317,8 +342,8 @@ export function updateNpm(finding, runNpm = packageRun) {
     return { strategy: "direct", manifestPath: relative(process.cwd(), manifestPath) };
   }
 
-  const beforeVersions = installedNpmVersions(finding.sourcePath, finding.dependency);
-  if (tryCompatibleNpmUpdate(finding, manifestPath, originalManifest, beforeVersions, runLockCommand)) {
+  const before = installedNpmResolutions(finding.sourcePath, finding.dependency);
+  if (tryCompatibleNpmUpdate(finding, affected, manifestPath, originalManifest, before, runLockCommand)) {
     return { strategy: "transitive-compatible", manifestPath: null };
   }
 
@@ -335,11 +360,11 @@ export function updateNpm(finding, runNpm = packageRun) {
     if (!Number.isInteger(error.status)) throw error;
     throw new NpmResolutionBlocked("npm rejected the scoped override", { cause: error });
   }
-  const resolved = installedNpmVersions(finding.sourcePath, finding.dependency);
-  if (resolved.includes(finding.version)) {
+  const resolved = installedNpmResolutions(finding.sourcePath, finding.dependency);
+  if ([...resolved.values()].includes(finding.version)) {
     throw new NpmResolutionBlocked(`npm kept ${finding.dependency}@${finding.version} after applying the scoped override`);
   }
-  if (!npmReachedFixedVersion(finding, beforeVersions, resolved)) {
+  if (!npmReachedFixedVersion(finding, affected, before, resolved)) {
     throw new NpmResolutionBlocked(`npm did not reach the known fixed version ${finding.fixedVersion} with the scoped override`);
   }
   return { strategy: "transitive-override", manifestPath: relative(process.cwd(), manifestPath) };
@@ -545,9 +570,9 @@ function assertNoOldPackageReferences(dependency) {
   }
 }
 
-function applyUpdate(finding) {
+function applyUpdate(finding, affected) {
   const base = basename(finding.sourcePath);
-  if (base === "package-lock.json") return updateNpm(finding);
+  if (base === "package-lock.json") return updateNpm(finding, packageRun, affected);
   if (base === "pnpm-lock.yaml") return updatePnpm(finding);
   if (base === "uv.lock") return updateUv(finding);
   throw new Error(`No remediation adapter for ${base}; OSV detection still covers it`);
@@ -579,9 +604,10 @@ function versionStillInstalled(finding) {
 export function applyAffectedUpdates(findings, selected) {
   const updates = [];
   let update;
-  for (const affected of affectedVersionsForCandidate(findings, selected)) {
+  const affectedVersions = affectedVersionsForCandidate(findings, selected);
+  for (const affected of affectedVersions) {
     if (updates.length > 0 && !versionStillInstalled(affected)) continue;
-    const applied = applyUpdate(affected);
+    const applied = applyUpdate(affected, affectedVersions);
     update ??= applied;
     updates.push({ version: affected.version, fixedVersion: affected.fixedVersion, strategy: applied.strategy });
   }
