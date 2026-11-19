@@ -384,6 +384,96 @@ describe("security remediation inputs", () => {
     }
   }, 30_000);
 
+  it("restores npm updates below the known fix even with a newer parallel version installed", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-floor-"));
+    try {
+      const manifestPath = join(dir, "package.json");
+      const lockfile = join(dir, "package-lock.json");
+      const lock = (version: string) => JSON.stringify({ packages: {
+        "node_modules/glob": { version },
+        "node_modules/unrelated/node_modules/glob": { version: "14.1.0" },
+      } });
+      writeFileSync(manifestPath, JSON.stringify({ name: "glob-fixture" }));
+      writeFileSync(lockfile, lock("13.0.6"));
+      const finding = { ...osv, dependency: "glob", version: "13.0.6", fixedVersion: "14.0.2", sourcePath: lockfile };
+
+      const runNpm = (acceptedVersion: string) => (_command: string, args: string[]) => {
+        if (args[0] === "update") {
+          writeFileSync(lockfile, lock("13.0.7"));
+        } else {
+          expect(readFileSync(lockfile, "utf8")).toBe(lock("13.0.6"));
+          expect(JSON.parse(readFileSync(manifestPath, "utf8")).overrides).toEqual({ "glob@13.0.6": "14.0.2" });
+          writeFileSync(lockfile, lock(acceptedVersion));
+        }
+      };
+
+      expect(updateNpm(finding, runNpm("14.0.2")).strategy).toBe("transitive-override");
+      expect(readFileSync(lockfile, "utf8")).toBe(lock("14.0.2"));
+      writeFileSync(lockfile, lock("13.0.6"));
+      expect(() => updateNpm(finding, runNpm("13.0.8"))).toThrow("did not reach the known fixed version 14.0.2");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["1.0.0", "3.0.2", "transitive-compatible"],
+    ["3.0.0", "3.0.2", "transitive-compatible"],
+    ["1.0.0", "3.0.1", "transitive-override"],
+    ["3.0.0", "3.0.2-rc.1", "transitive-override"],
+  ])("uses each affected npm line's own stable floor (%s, %s)", (selectedVersion, resolvedHigh, strategy) => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-parallel-floor-"));
+    try {
+      const manifest = join(dir, "package.json");
+      const lockfile = join(dir, "package-lock.json");
+      const lock = (low: string, high: string) => JSON.stringify({ packages: {
+        "node_modules/uuid": { version: low },
+        "node_modules/parent/node_modules/uuid": { version: high },
+      } });
+      const initial = lock("1.0.0", "3.0.0");
+      writeFileSync(manifest, JSON.stringify({ name: "parallel-npm-fixture" }));
+      writeFileSync(lockfile, initial);
+      const affected = [
+        { ...osv, version: "1.0.0", fixedVersion: "1.0.2", sourcePath: lockfile },
+        { ...osv, version: "3.0.0", fixedVersion: "3.0.2", sourcePath: lockfile },
+      ];
+      const selected = affected.find((entry) => entry.version === selectedVersion)!;
+      const result = updateNpm(selected, (_command: string, args: string[]) => {
+        if (args[0] === "update") {
+          writeFileSync(lockfile, lock("1.0.2", resolvedHigh));
+        } else {
+          expect(readFileSync(lockfile, "utf8")).toBe(initial);
+          expect(JSON.parse(readFileSync(manifest, "utf8")).overrides)
+            .toEqual({ [`uuid@${selectedVersion}`]: selected.fixedVersion });
+          writeFileSync(lockfile, selectedVersion === "1.0.0" ? lock("1.0.2", "3.0.0") : lock("1.0.0", "3.0.2"));
+        }
+      }, affected);
+      expect(result.strategy).toBe(strategy);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts an affected nested npm resolution hoisted to its fixed ancestor", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-hoist-"));
+    try {
+      const lockfile = join(dir, "package-lock.json");
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "hoist-fixture" }));
+      writeFileSync(lockfile, JSON.stringify({ packages: {
+        "node_modules/parent/node_modules/uuid": { version: "9.0.1" },
+      } }));
+      const result = updateNpm({ ...osv, sourcePath: lockfile }, (_command: string, args: string[]) => {
+        expect(args[0]).toBe("update");
+        writeFileSync(lockfile, JSON.stringify({ packages: {
+          "node_modules/uuid": { version: "11.1.1" },
+        } }));
+      });
+      expect(result.strategy).toBe("transitive-compatible");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("restores partial npm update output before falling back to an exact scoped override", () => {
     const dir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-fallback-"));
     try {
