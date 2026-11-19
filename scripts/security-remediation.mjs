@@ -9,6 +9,7 @@ import { parse, parseDocument } from "yaml";
 import { validateSecurityConfig } from "./config.mjs";
 import { compatibilityMappingFor, loadCompatibilityMappings } from "./compatibility-mappings.mjs";
 import {
+  compareVersions,
   findingKey,
   findingsFromOsvJson,
   isSecurityDependencyOnly,
@@ -262,20 +263,27 @@ function installedNpmVersion(lockfile, dependency) {
   return versions.length === 1 ? versions[0] : null;
 }
 
-function tryCompatibleNpmUpdate(finding, manifestPath, originalManifest, runLockCommand) {
+function npmReachedFixedVersion(finding, beforeVersions, afterVersions) {
+  const meetsFloor = (version) => compareVersions(version, finding.fixedVersion) >= 0;
+  return !afterVersions.includes(finding.version) && afterVersions.some(meetsFloor) &&
+    afterVersions.every((version) => beforeVersions.includes(version) || meetsFloor(version));
+}
+
+function tryCompatibleNpmUpdate(finding, manifestPath, originalManifest, beforeVersions, runLockCommand) {
   const originalLock = readFileSync(finding.sourcePath);
   try {
     runLockCommand("update", finding.dependency);
+    if (npmReachedFixedVersion(finding, beforeVersions, installedNpmVersions(finding.sourcePath, finding.dependency))) {
+      return true;
+    }
   } catch (error) {
     if (!String(error.stderr ?? "").includes("Cannot read properties of null (reading 'edgesOut')")) throw error;
-    // npm's update path can crash in Arborist. Retry through the existing exact-override path with pristine inputs.
-    writeFileSync(manifestPath, originalManifest);
-    writeFileSync(finding.sourcePath, originalLock);
     summary(`- ${finding.dependency}: npm's compatible update crashed; trying the scoped override.`);
-    return false;
   }
-  const updated = installedNpmVersions(finding.sourcePath, finding.dependency);
-  return updated.length > 0 && !updated.includes(finding.version);
+  // Scope the override to the original resolution even if npm moved it to another vulnerable version.
+  writeFileSync(manifestPath, originalManifest);
+  writeFileSync(finding.sourcePath, originalLock);
+  return false;
 }
 
 export function updateNpm(finding, runNpm = packageRun) {
@@ -309,7 +317,8 @@ export function updateNpm(finding, runNpm = packageRun) {
     return { strategy: "direct", manifestPath: relative(process.cwd(), manifestPath) };
   }
 
-  if (tryCompatibleNpmUpdate(finding, manifestPath, originalManifest, runLockCommand)) {
+  const beforeVersions = installedNpmVersions(finding.sourcePath, finding.dependency);
+  if (tryCompatibleNpmUpdate(finding, manifestPath, originalManifest, beforeVersions, runLockCommand)) {
     return { strategy: "transitive-compatible", manifestPath: null };
   }
 
@@ -326,8 +335,12 @@ export function updateNpm(finding, runNpm = packageRun) {
     if (!Number.isInteger(error.status)) throw error;
     throw new NpmResolutionBlocked("npm rejected the scoped override", { cause: error });
   }
-  if (installedNpmVersions(finding.sourcePath, finding.dependency).includes(finding.version)) {
+  const resolved = installedNpmVersions(finding.sourcePath, finding.dependency);
+  if (resolved.includes(finding.version)) {
     throw new NpmResolutionBlocked(`npm kept ${finding.dependency}@${finding.version} after applying the scoped override`);
+  }
+  if (!npmReachedFixedVersion(finding, beforeVersions, resolved)) {
+    throw new NpmResolutionBlocked(`npm did not reach the known fixed version ${finding.fixedVersion} with the scoped override`);
   }
   return { strategy: "transitive-override", manifestPath: relative(process.cwd(), manifestPath) };
 }

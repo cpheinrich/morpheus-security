@@ -38,7 +38,8 @@ When a transitive npm or pnpm parent range cannot reach a fix, the generated ove
 the vulnerable installed version so parallel incompatible major lines are not collapsed.
 When an earlier pnpm override resolves to that vulnerable version, the updater also advances the
 earlier selector; pnpm does not chain overrides. If npm’s compatible update hits the Arborist
-resolver crash, the engine restores the input files and tries the scoped override. If the override
+resolver crash or stops below the known fix, the engine restores the input files and tries the
+scoped override. If the override
 cannot clear the installed version, it records the blocker and tries the next eligible dependency.
 An advisory in a lockfile with no remediation adapter is also recorded and left open while the
 sweep proceeds.
