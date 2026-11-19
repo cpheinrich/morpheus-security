@@ -12,6 +12,7 @@ import {
   combineFindings,
   malwareIncidentBody,
   nextCandidate,
+  readMergeState,
   restCheckRollup,
   restMergeReadiness,
   requiredChecksReady,
@@ -70,6 +71,13 @@ describe("security remediation inputs", () => {
     expect(nextCandidate([unpatched, partiallyPatchable, independent], { holds: [] }, []))
       .toEqual(independent);
     expect(nextCandidate([partiallyPatchable, unpatched], { holds: [] }, [])).toBeNull();
+  });
+
+  it("allows a separate lockfile for the same dependency while reserving the open lockfile", () => {
+    const separate = { ...osv, sourcePath: "tools/package-lock.json" };
+    const open = [{ body: "Dependency: `uuid`\nLockfile: `package-lock.json`" }];
+    expect(nextCandidate([osv, separate], { holds: [] }, open)).toEqual(separate);
+    expect(nextCandidate([osv], { holds: [] }, open)).toBeNull();
   });
 
   it("groups every vulnerable version in one lockfile without crossing lockfiles", () => {
@@ -376,6 +384,45 @@ describe("security remediation inputs", () => {
     }
   }, 30_000);
 
+  it("restores partial npm update output before falling back to an exact scoped override", () => {
+    const dir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-fallback-"));
+    try {
+      const manifestPath = join(dir, "package.json");
+      const lockfile = join(dir, "package-lock.json");
+      const manifest = { name: "fallback-fixture", overrides: { other: "2.0.0" } };
+      const lock = JSON.stringify({ packages: { "node_modules/uuid": { version: "9.0.1" } } });
+      writeFileSync(manifestPath, JSON.stringify(manifest));
+      writeFileSync(lockfile, lock);
+
+      const calls: string[][] = [];
+      const result = updateNpm({ ...osv, sourcePath: lockfile }, (
+        command: string, args: string[], options: { cwd: string },
+      ) => {
+        expect(command).toBe("npm");
+        expect(options.cwd).toBe(dir);
+        expect(args).toContain("--ignore-scripts");
+        calls.push(args);
+        if (args[0] === "update") {
+          writeFileSync(manifestPath, "partial update");
+          writeFileSync(lockfile, "partial update");
+          throw Object.assign(new Error("npm failed"), {
+            stderr: "npm error Cannot read properties of null (reading 'edgesOut')",
+          });
+        }
+        expect(readFileSync(lockfile, "utf8")).toBe(lock);
+        expect(JSON.parse(readFileSync(manifestPath, "utf8"))).toEqual({
+          ...manifest, overrides: { other: "2.0.0", "uuid@9.0.1": "11.1.1" },
+        });
+        writeFileSync(lockfile, JSON.stringify({ packages: { "node_modules/uuid": { version: "11.1.1" } } }));
+      });
+
+      expect(calls.map((args) => args[0])).toEqual(["update", "install"]);
+      expect(result.strategy).toBe("transitive-override");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("rejects repository registry overrides and non-registry direct specs", () => {
     const pnpmDir = mkdtempSync(join(tmpdir(), "morpheus-security-pnpm-config-"));
     const npmDir = mkdtempSync(join(tmpdir(), "morpheus-security-npm-spec-"));
@@ -543,6 +590,19 @@ describe("security remediation inputs", () => {
     expect(staleCandidateAction("BLOCKED")).toBe("continue");
     expect(staleCandidateAction("behind")).toBe("recreate");
     expect(staleCandidateAction(null)).toBe("wait");
+  });
+
+  it("rechecks a merge state GitHub is still calculating", async () => {
+    const unknown = { state: "open", draft: false, mergeable: null, mergeable_state: "unknown" };
+    const resolved = { ...unknown, mergeable: true, mergeable_state: "behind" };
+    const states = [unknown, unknown, resolved];
+    const waits: number[] = [];
+    const pause = async (ms: number) => { waits.push(ms); };
+    expect(await readMergeState(() => states.shift(), pause)).toEqual(resolved);
+    expect(waits).toEqual([1000, 2000]);
+    waits.length = 0;
+    expect(await readMergeState(() => unknown, pause)).toEqual(unknown);
+    expect(waits).toEqual([1000, 2000, 4000]);
   });
 
   it("does not require the Actions-only GraphQL check-rollup field", () => {
