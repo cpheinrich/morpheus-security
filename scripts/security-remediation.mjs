@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { parse, parseDocument } from "yaml";
 import { validateSecurityConfig } from "./config.mjs";
@@ -22,6 +23,9 @@ const INCIDENT_LABELS = [
   ["needs-exposure-review", "d4c5f9", "Human exposure assessment required"],
 ];
 const CANDIDATE_CHECK = "Morpheus Security / candidate";
+const REMEDIATION_LOCKFILES = new Set(["package-lock.json", "pnpm-lock.yaml", "uv.lock"]);
+
+class NpmResolutionBlocked extends Error {}
 
 function required(name) {
   const value = process.env[name];
@@ -77,8 +81,11 @@ function output(name, value) {
 }
 
 function summary(markdown) {
-  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${markdown.trim()}\n`);
-  else process.stdout.write(`${markdown.trim()}\n`);
+  const line = `${markdown.trim()}\n`;
+  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, line);
+  // Prefix modern workflow commands and neutralize the legacy marker, which can appear anywhere in a line.
+  const logLines = line.trimEnd().split(/\r\n?|\n/);
+  process.stdout.write(logLines.map((part) => `Morpheus Security: ${part.replaceAll("##[", "## [")}\n`).join(""));
 }
 
 function loadConfig() {
@@ -139,8 +146,7 @@ export function nextCompatibilityCandidate(findings, mappings, config, open) {
   const openLockfiles = new Set(open.map((pr) => /Lockfile: `([^`]+)`/.exec(pr.body ?? "")?.[1]).filter(Boolean));
   for (const finding of findings) {
     const mapping = compatibilityMappingFor(finding, mappings);
-    if (!mapping || held(finding, config) || openLockfiles.has(finding.sourcePath) ||
-        open.some((pr) => String(pr.body ?? "").includes(`Dependency: \`${finding.dependency}\``))) continue;
+    if (!mapping || held(finding, config) || openLockfiles.has(finding.sourcePath)) continue;
     if (!["pnpm-lock.yaml", "package-lock.json"].includes(basename(finding.sourcePath))) continue;
     return { finding, mapping };
   }
@@ -152,7 +158,6 @@ export function nextCandidate(findings, config, open) {
   return findings.find((finding) => (finding.fixedVersion || finding.malicious) &&
     (finding.malicious || affectedVersionsForCandidate(findings, finding).every((affected) => affected.fixedVersion)) &&
     !held(finding, config) &&
-    !open.some((pr) => String(pr.body ?? "").includes(`Dependency: \`${finding.dependency}\``)) &&
     !openLockfiles.has(finding.sourcePath)) ?? null;
 }
 
@@ -257,19 +262,38 @@ function installedNpmVersion(lockfile, dependency) {
   return versions.length === 1 ? versions[0] : null;
 }
 
-export function updateNpm(finding) {
+function tryCompatibleNpmUpdate(finding, manifestPath, originalManifest, runLockCommand) {
+  const originalLock = readFileSync(finding.sourcePath);
+  try {
+    runLockCommand("update", finding.dependency);
+  } catch (error) {
+    if (!String(error.stderr ?? "").includes("Cannot read properties of null (reading 'edgesOut')")) throw error;
+    // npm's update path can crash in Arborist. Retry through the existing exact-override path with pristine inputs.
+    writeFileSync(manifestPath, originalManifest);
+    writeFileSync(finding.sourcePath, originalLock);
+    summary(`- ${finding.dependency}: npm's compatible update crashed; trying the scoped override.`);
+    return false;
+  }
+  const updated = installedNpmVersions(finding.sourcePath, finding.dependency);
+  return updated.length > 0 && !updated.includes(finding.version);
+}
+
+export function updateNpm(finding, runNpm = packageRun) {
   const root = packageRoot(finding.sourcePath);
   assertOfficialNpmConfiguration(root);
   const manifestPath = join(root, "package.json");
   if (!existsSync(manifestPath)) throw new Error(`No package.json beside ${finding.sourcePath}`);
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const originalManifest = readFileSync(manifestPath);
+  const manifest = JSON.parse(originalManifest.toString("utf8"));
+  const lockOnlyArgs = ["--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)];
+  const runLockCommand = (...command) => runNpm("npm", [...command, ...lockOnlyArgs], { cwd: root });
   const groups = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
   const direct = groups.find((group) => Object.hasOwn(manifest[group] ?? {}, finding.dependency));
   if (finding.malicious && !finding.fixedVersion) {
     if (!direct) throw new Error(`Malicious transitive ${finding.dependency} has no fixed version; incident opened but automatic removal is unsafe`);
     delete manifest[direct][finding.dependency];
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-    packageRun("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
+    runLockCommand("install");
     return { strategy: "remove-malicious-direct", manifestPath: relative(process.cwd(), manifestPath) };
   }
   if (!finding.fixedVersion) throw new Error(`${finding.advisory} has no fixed version`);
@@ -281,13 +305,11 @@ export function updateNpm(finding) {
     const prefix = /^[~^]/.test(current) ? current[0] : "";
     manifest[direct][finding.dependency] = `${prefix}${finding.fixedVersion}`;
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-    packageRun("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
+    runLockCommand("install");
     return { strategy: "direct", manifestPath: relative(process.cwd(), manifestPath) };
   }
 
-  packageRun("npm", ["update", finding.dependency, "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
-  const updated = installedNpmVersions(finding.sourcePath, finding.dependency);
-  if (updated.length > 0 && !updated.includes(finding.version)) {
+  if (tryCompatibleNpmUpdate(finding, manifestPath, originalManifest, runLockCommand)) {
     return { strategy: "transitive-compatible", manifestPath: null };
   }
 
@@ -298,7 +320,15 @@ export function updateNpm(finding) {
   const selector = `${finding.dependency}@${finding.version}`;
   refreshed.overrides = { ...(refreshed.overrides ?? {}), [selector]: finding.fixedVersion };
   writeFileSync(manifestPath, `${JSON.stringify(refreshed, null, 2)}\n`);
-  packageRun("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs(finding.dependency)], { cwd: root });
+  try {
+    runLockCommand("install");
+  } catch (error) {
+    if (!Number.isInteger(error.status)) throw error;
+    throw new NpmResolutionBlocked("npm rejected the scoped override", { cause: error });
+  }
+  if (installedNpmVersions(finding.sourcePath, finding.dependency).includes(finding.version)) {
+    throw new NpmResolutionBlocked(`npm kept ${finding.dependency}@${finding.version} after applying the scoped override`);
+  }
   return { strategy: "transitive-override", manifestPath: relative(process.cwd(), manifestPath) };
 }
 
@@ -644,6 +674,57 @@ export function assertOfficialUvArtifacts(lockfile, beforeText) {
   }
 }
 
+function tryNpmCandidate(findings, finding) {
+  const manifestPath = join(packageRoot(finding.sourcePath), "package.json");
+  const beforeManifest = readFileSync(manifestPath);
+  const beforeLock = readFileSync(finding.sourcePath);
+  const statusArgs = ["status", "--porcelain", "--untracked-files=all"];
+  const beforeStatus = run("git", statusArgs);
+  try {
+    return { applied: applyAffectedUpdates(findings, finding) };
+  } catch (error) {
+    if (!(error instanceof NpmResolutionBlocked)) throw error;
+    writeFileSync(manifestPath, beforeManifest);
+    writeFileSync(finding.sourcePath, beforeLock);
+    if (run("git", statusArgs) !== beforeStatus) {
+      throw new Error("Cannot continue safely after the npm resolver changed other files", { cause: error });
+    }
+    return { reason: error.message };
+  }
+}
+
+function attemptCandidate(findings, finding, compatibility, config, lockfile) {
+  if (!REMEDIATION_LOCKFILES.has(lockfile)) return { reason: `no remediation adapter for ${lockfile}` };
+  if (compatibility) {
+    return { applied: { update: applyCompatibilityReplacement(finding, compatibility.mapping, config), updates: [] } };
+  }
+  return lockfile === "package-lock.json" ? tryNpmCandidate(findings, finding)
+    : { applied: applyAffectedUpdates(findings, finding) };
+}
+
+function prepareNextCandidate(repo, findings, config, open) {
+  const blocked = [];
+  let eligible = findings;
+  for (;;) {
+    const ordinary = nextCandidate(eligible, config, open);
+    const compatibility = ordinary || repo !== "cpheinrich/morpheus" ? null
+      : nextCompatibilityCandidate(eligible, loadCompatibilityMappings(), config, open);
+    const finding = ordinary ?? compatibility?.finding;
+    if (!finding) return { blocked };
+
+    const { dependency, advisory, sourcePath } = finding;
+    const lockfile = basename(sourcePath);
+    const beforeLock = lockfile === "package-lock.json" || lockfile === "pnpm-lock.yaml"
+      ? readFileSync(sourcePath, "utf8") : null;
+    const result = attemptCandidate(findings, finding, compatibility, config, lockfile);
+    if (result.applied) return { finding, compatibility, beforeLock, blocked, ...result.applied };
+
+    blocked.push({ dependency, advisory, sourcePath, reason: result.reason });
+    summary(`- ${sourcePath}: ${dependency} (${advisory}) is blocked: ${result.reason}.`);
+    eligible = eligible.filter((entry) => entry.sourcePath !== sourcePath || entry.dependency !== dependency);
+  }
+}
+
 function prepare() {
   const repo = targetRepository();
   const scanFile = required("SCAN_FILE");
@@ -662,23 +743,15 @@ function prepare() {
     finding.incidentUrl = upsertMalwareIncident(repo, finding, findings);
   }
 
-  const ordinary = nextCandidate(findings, config, open);
-  const compatibility = ordinary || repo !== "cpheinrich/morpheus" ? null
-    : nextCompatibilityCandidate(findings, loadCompatibilityMappings(), config, open);
-  const finding = ordinary ?? compatibility?.finding;
+  const { finding, compatibility, beforeLock, update, updates, blocked } = prepareNextCandidate(repo, findings, config, open);
   if (!finding) {
     const unpatched = findings.filter((candidate) => !candidate.fixedVersion && !candidate.malicious);
-    writeFileSync(planFile, JSON.stringify({ status: findings.length ? "waiting" : "clean", findings, unpatched, open: open.map((pr) => pr.html_url) }, null, 2));
+    writeFileSync(planFile, JSON.stringify({ status: findings.length ? "waiting" : "clean", findings, unpatched, blocked, open: open.map((pr) => pr.html_url) }, null, 2));
     output("changed", "false");
-    summary(findings.length ? `## Security remediation\n\nNo new PR: ${open.length} bot PR(s) already cover available lockfiles, project holds apply, or no fixed version is published for ${unpatched.length} finding(s). These findings remain open.` : "## Security remediation\n\nOSV and GitHub advisory inputs are clean.");
+    summary(findings.length ? `## Security remediation\n\nNo new PR. Open bot PRs: ${open.length}. Findings without a fixed version: ${unpatched.length}. Candidate blockers: ${blocked.length}. Remaining findings were not cleared.` : "## Security remediation\n\nOSV and GitHub advisory inputs are clean.");
     return;
   }
 
-  const beforeLock = ["package-lock.json", "pnpm-lock.yaml"].includes(basename(finding.sourcePath))
-    ? readFileSync(finding.sourcePath, "utf8") : null;
-  const { update, updates } = compatibility
-    ? { update: applyCompatibilityReplacement(finding, compatibility.mapping, config), updates: [] }
-    : applyAffectedUpdates(findings, finding);
   const changedFiles = run("git", ["diff", "--name-only"]).split("\n").filter(Boolean);
   const importFiles = compatibility ? update.importFiles : [];
   const generatedFiles = compatibility ? update.generatedFiles : [];
@@ -698,7 +771,7 @@ function prepare() {
     assertOfficialUvArtifacts(finding.sourcePath, update.beforeLock);
     delete update.beforeLock;
   }
-  const plan = { status: "prepared", finding, update, updates, changedFiles,
+  const plan = { status: "prepared", finding, update, updates, changedFiles, blocked,
     ...(compatibility ? { compatibility: compatibility.mapping } : {}), beforeSha: run("git", ["rev-parse", "HEAD"]) };
   mkdirSync(dirname(planFile), { recursive: true });
   writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
@@ -782,8 +855,18 @@ export function restMergeReadiness(pull, checkPages, statusPages) {
   };
 }
 
-function mergeReadiness(repo, prNumber, headSha) {
-  const pull = gh(["api", `repos/${repo}/pulls/${prNumber}`]);
+export async function readMergeState(readPull, pause = delay) {
+  let pull = readPull();
+  for (const milliseconds of [1_000, 2_000, 4_000]) {
+    if (pull?.state !== "open" || pull.draft ||
+        (pull.mergeable != null && staleCandidateAction(pull.mergeable_state) !== "wait")) break;
+    await pause(milliseconds);
+    pull = readPull();
+  }
+  return pull;
+}
+
+function mergeReadiness(repo, pull, headSha) {
   const checkPages = gh(["api", "--paginate", "--slurp",
     `repos/${repo}/commits/${headSha}/check-runs?per_page=100`]);
   const statusPages = gh(["api", "--paginate", "--slurp",
@@ -898,7 +981,8 @@ function deliver() {
     summary(`## Security remediation dry run\n\nValidated ${finding.dependency}: scoped diff, official artifacts, and clean candidate rescan.`);
     return;
   }
-  const branch = `morpheus-security/${slug(finding.ecosystem)}-${slug(finding.dependency)}-${slug(finding.advisory)}-${plan.beforeSha.slice(0, 8)}`;
+  const lockfileId = createHash("sha256").update(finding.sourcePath).digest("hex").slice(0, 12);
+  const branch = `morpheus-security/${slug(finding.ecosystem)}-${slug(finding.dependency)}-${slug(finding.advisory)}-${lockfileId}-${plan.beforeSha.slice(0, 8)}`;
   run("git", ["config", "user.name", botLogin]);
   run("git", ["config", "user.email", `${botLogin.replace(/\[bot\]$/, "")}[bot]@users.noreply.github.com`]);
   run("git", ["switch", "-c", branch]);
@@ -931,13 +1015,104 @@ function deliver() {
   summary(`## Security remediation\n\nOpened ${url} for ${finding.dependency}. A later run will merge it only after the explicit required checks pass.`);
 }
 
-function reconcile() {
+function importReviewReady(repo, pr, attestation, config) {
+  if (repo !== "cpheinrich/morpheus") {
+    summary(`- ${pr.html_url}: import-only merge is not enabled for this repository.`);
+    return false;
+  }
+  const mapping = loadCompatibilityMappings().find((entry) =>
+    entry.dependency === attestation.dependency && entry.replacement === attestation.replacement &&
+    entry.version === attestation.replacementVersion &&
+    [attestation.advisory, ...attestation.aliases].includes(entry.advisory));
+  if (!config.importOnlyCompatibility || !mapping) {
+    summary(`- ${pr.html_url}: not merged because the import-only opt-in or reviewed mapping is absent.`);
+    return false;
+  }
+  const pages = gh(["api", "--paginate", "--slurp", `repos/${repo}/issues/${pr.number}/comments?per_page=100`]);
+  if (!verifiedIndependentReview((pages ?? []).flatMap((page) => page), repo, pr.number, attestation.headSha)) {
+    summary(`- ${pr.html_url}: waiting for a separate Manager App review of this exact head.`);
+    return false;
+  }
+  return true;
+}
+
+function currentCandidate(repo, pr, config) {
+  const headSha = pr.head?.sha;
+  if (!/^[0-9a-f]{40}$/.test(headSha ?? "")) {
+    summary(`- ${pr.html_url}: not merged because its head is invalid.`);
+    return null;
+  }
+  const checkRuns = gh(["api", `repos/${repo}/commits/${headSha}/check-runs?check_name=${encodeURIComponent(CANDIDATE_CHECK)}`]);
+  const botSlug = required("BOT_LOGIN").replace(/\[bot\]$/, "");
+  const attestation = verifiedCandidateAttestation(checkRuns?.check_runs, botSlug, headSha, repo);
+  if (!attestation) {
+    summary(`- ${pr.html_url}: not merged because no valid App-owned candidate attestation covers its head.`);
+    return null;
+  }
+  const hold = held({ dependency: attestation.dependency, aliases: [attestation.advisory, ...attestation.aliases] }, config);
+  if (hold) {
+    summary(`- ${pr.html_url}: project hold: ${hold.reason ?? attestation.dependency}.`);
+    return null;
+  }
+  if (config.requiredChecks.length === 0) {
+    summary(`- ${pr.html_url}: automatic merge is disabled because no requiredChecks are configured.`);
+    return null;
+  }
+  if (attestation.mode === "import-only-compatibility" && !importReviewReady(repo, pr, attestation, config)) return null;
+  return attestation;
+}
+
+function sameOpenPull(pull, original, repo, defaultBranch) {
+  return pull?.state === "open" && pull.user?.login === original.user.login &&
+    pull.head?.sha === original.head.sha && pull.head?.ref === original.head.ref &&
+    pull.head?.repo?.full_name === repo && pull.base?.ref === defaultBranch &&
+    pull.base?.repo?.full_name === repo;
+}
+
+function reconciliationAction(repo, pull, attestation, config) {
+  if (pull.draft) return "ready";
+  const action = staleCandidateAction(pull.mergeable == null ? null : pull.mergeable_state);
+  if (action === "wait") {
+    summary(`- ${pull.html_url}: waiting because GitHub did not resolve its merge state after retrying.`);
+    return null;
+  }
+  if (action === "recreate") return "close";
+
+  const detail = mergeReadiness(repo, pull, attestation.headSha);
+  const readiness = requiredChecksReady(detail.statusCheckRollup, config.requiredChecks,
+    { importReviewSuperseded: attestation.mode === "import-only-compatibility" });
+  if (!readiness.ready) {
+    summary(`- ${pull.html_url}: waiting; ${readiness.reason}.`);
+    return null;
+  }
+  return "merge";
+}
+
+function applyReconciliationAction(repo, pull, action) {
+  const options = {
+    ready: [[], "marked the attested candidate ready for review; a later run will verify its checks and merge."],
+    close: [["--delete-branch"], "closed because its base is stale or conflicted; a replacement requires fresh validation."],
+    merge: [["--match-head-commit", pull.head.sha, "--squash", "--delete-branch"], "merged after every explicit required check passed."],
+  };
+  const [args, description] = options[action];
+  try {
+    run("gh", ["pr", action, String(pull.number), "--repo", repo, ...args]);
+    summary(`- ${pull.html_url}: ${description}`);
+    return action === "merge";
+  } catch (error) {
+    summary(`- ${pull.html_url}: GitHub rejected ${action} (${String(error.stderr ?? error.message).trim()})`);
+    return false;
+  }
+}
+
+async function reconcile() {
   const repo = targetRepository();
   const defaultBranch = required("DEFAULT_BRANCH");
   const config = loadConfig();
   const checkedOutSha = run("git", ["rev-parse", "HEAD"]);
-  const initialLiveSha = run("gh", ["api", `repos/${repo}/commits/${defaultBranch}`, "--jq", ".sha"]);
-  if (checkedOutSha !== initialLiveSha) {
+  const defaultBranchIsCurrent = () =>
+    run("gh", ["api", `repos/${repo}/commits/${defaultBranch}`, "--jq", ".sha"]) === checkedOutSha;
+  if (!defaultBranchIsCurrent()) {
     summary(`- Reconciliation stopped because ${defaultBranch} changed after checkout.`);
     output("open_prs", "0");
     output("merged", "false");
@@ -946,72 +1121,21 @@ function reconcile() {
   const open = openSecurityPulls(repo);
   let merged = false;
   for (const pr of open) {
-    const headSha = pr.head?.sha;
-    if (!/^[0-9a-f]{40}$/.test(headSha ?? "")) {
-      summary(`- ${pr.html_url}: not merged because its head is invalid.`);
+    const candidate = currentCandidate(repo, pr, config);
+    if (!candidate) continue;
+    const pull = await readMergeState(() => gh(["api", `repos/${repo}/pulls/${pr.number}`]));
+    if (!sameOpenPull(pull, pr, repo, defaultBranch)) {
+      summary(`- ${pr.html_url}: waiting because the attested pull request or its target changed.`);
       continue;
     }
-    const checkRuns = gh(["api", `repos/${repo}/commits/${headSha}/check-runs?check_name=${encodeURIComponent(CANDIDATE_CHECK)}`]);
-    const botSlug = required("BOT_LOGIN").replace(/\[bot\]$/, "");
-    const attestation = verifiedCandidateAttestation(checkRuns?.check_runs, botSlug, headSha, repo);
-    if (!attestation) {
-      summary(`- ${pr.html_url}: not merged because no valid App-owned candidate attestation covers its head.`);
-      continue;
-    }
-    if (attestation.mode === "import-only-compatibility") {
-      if (repo !== "cpheinrich/morpheus") {
-        summary(`- ${pr.html_url}: import-only merge is not enabled for this repository.`);
-        continue;
-      }
-      const mapping = loadCompatibilityMappings().find((entry) =>
-        entry.dependency === attestation.dependency && entry.replacement === attestation.replacement &&
-        entry.version === attestation.replacementVersion &&
-        [attestation.advisory, ...attestation.aliases].includes(entry.advisory));
-      if (!config.importOnlyCompatibility || !mapping) {
-        summary(`- ${pr.html_url}: not merged because the import-only opt-in or reviewed mapping is absent.`);
-        continue;
-      }
-      const pages = gh(["api", "--paginate", "--slurp", `repos/${repo}/issues/${pr.number}/comments?per_page=100`]);
-      if (!verifiedIndependentReview((pages ?? []).flatMap((page) => page), repo, pr.number, headSha)) {
-        summary(`- ${pr.html_url}: waiting for a separate Manager App review of this exact head.`);
-        continue;
-      }
-    }
-    if (held({ dependency: attestation.dependency, aliases: attestation.aliases }, config)) {
-      summary(`- ${pr.html_url}: not merged because of the current project hold.`);
-      continue;
-    }
-    const detail = mergeReadiness(repo, pr.number, headSha);
-    const staleAction = staleCandidateAction(detail?.mergeStateStatus);
-    if (staleAction === "recreate") {
-      run("gh", ["pr", "close", String(pr.number), "--repo", repo, "--delete-branch"]);
-      summary(`- ${pr.html_url}: closed because its base is stale or conflicted; this run will recreate the candidate from current main and require fresh validation.`);
-      continue;
-    }
-    if (staleAction === "wait") {
-      summary(`- ${pr.html_url}: waiting because GitHub has not resolved its merge state.`);
-      continue;
-    }
-    const readiness = requiredChecksReady(detail?.statusCheckRollup, config.requiredChecks,
-      { importReviewSuperseded: attestation.mode === "import-only-compatibility" });
-    if (!readiness.ready) {
-      summary(`- ${pr.html_url}: waiting; ${readiness.reason}.`);
-      continue;
-    }
-    const liveSha = run("gh", ["api", `repos/${repo}/commits/${defaultBranch}`, "--jq", ".sha"]);
-    if (liveSha !== checkedOutSha) {
-      summary(`- ${pr.html_url}: not merged because ${defaultBranch} changed during reconciliation.`);
+    const action = reconciliationAction(repo, pull, candidate, config);
+    if (!action) continue;
+    if (!defaultBranchIsCurrent()) {
+      summary(`- ${pr.html_url}: waiting because ${defaultBranch} changed during reconciliation.`);
       break;
     }
-    try {
-      run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--match-head-commit", headSha,
-        "--squash", "--delete-branch"]);
-      merged = true;
-      summary(`- ${pr.html_url}: merged after every explicit required check passed.`);
-      break;
-    } catch (error) {
-      summary(`- ${pr.html_url}: merge rejected by GitHub (${String(error.stderr ?? error.message).trim()})`);
-    }
+    merged = applyReconciliationAction(repo, pull, action);
+    if (merged) break;
   }
   output("open_prs", String(open.length));
   output("merged", String(merged));
@@ -1021,6 +1145,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const command = process.argv[2];
   if (command === "prepare") prepare();
   else if (command === "deliver") deliver();
-  else if (command === "reconcile") reconcile();
+  else if (command === "reconcile") await reconcile();
   else throw new Error("Usage: security-remediation.mjs prepare|deliver|reconcile");
 }

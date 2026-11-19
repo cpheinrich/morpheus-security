@@ -10,7 +10,7 @@ waiting; it does not stop a later actionable finding in the same repository. Mal
 retain their separate incident and removal path. If an advisory affects multiple installed
 versions in one lockfile, every version needs a fix before that dependency is selected.
 
-The private nightly caller starts from the reviewed central allowlist and asks GitHub whether each
+The private scheduled caller starts from the reviewed central allowlist and asks GitHub whether each
 exact repository has installed the App. It processes only entries whose default branch also contains
 a valid `.github/morpheus-security.json`. These three independent gates prevent an unknown public
 installation from consuming the runner. The workflow uses the master private key only to obtain a
@@ -37,15 +37,20 @@ An explicit repository `.npmrc` is accepted only when its registry entries name
 When a transitive npm or pnpm parent range cannot reach a fix, the generated override is scoped to
 the vulnerable installed version so parallel incompatible major lines are not collapsed.
 When an earlier pnpm override resolves to that vulnerable version, the updater also advances the
-earlier selector; pnpm does not chain overrides.
+earlier selector; pnpm does not chain overrides. If npm’s compatible update hits the Arborist
+resolver crash, the engine restores the input files and tries the scoped override. If the override
+cannot clear the installed version, it records the blocker and tries the next eligible dependency.
+An advisory in a lockfile with no remediation adapter is also recorded and left open while the
+sweep proceeds.
 
 ## Pull requests and merges
 
-One dependency is one pull request, including every affected installed version of that dependency
-in the selected lockfile. Versions on incompatible lines receive their own smallest fixed version.
-At most one bot PR is open per lockfile, so updates cannot race
-the same lock graph. The creation run records an App-owned Check Run attestation for the exact
-candidate head and never merges it. A later nightly reconciliation requires that attestation,
+One dependency in one lockfile is one pull request, including every affected installed version
+in that lockfile. Versions on incompatible lines receive their own smallest fixed version.
+At most one bot PR is open per lockfile, so updates cannot race the same lock graph. Separate
+lockfiles can progress independently, including when affected by the same dependency and advisory.
+The creation run records an App-owned Check Run attestation for the exact
+candidate head and never merges it. A later reconciliation requires that attestation,
 requires every explicitly configured `requiredChecks` entry to have passed, and atomically limits
 the merge to that head. An empty check list disables automatic merging. Branch protection and
 review rules remain additional authority. Human-authored PRs never receive the bot waiver.
@@ -67,7 +72,11 @@ branch before reconciliation, revalidates its opt-in policy, and verifies the br
 both merge and scan.
 
 Project holds live in `.github/morpheus-security.json` and name the dependency, optional advisory,
-and reason. A hold leaves the PR open and prevents duplicates until policy changes.
+and reason. A hold leaves the PR open and prevents duplicates until policy changes. Use that
+committed hold to pause the bot. A bot-owned draft with a current attestation and merge policy
+is marked ready when no hold or separate review requirement blocks it. A subsequent run still
+checks CI and GitHub protection before merging. An unresolved GitHub merge state is retried
+within the run. The private job log and step summary record each disposition or refusal.
 
 Dependabot alerts remain an advisory input, but automatic Dependabot security-fix PRs are disabled
 after the first clean Morpheus Security run. Routine non-security upgrades are a separate lane.
