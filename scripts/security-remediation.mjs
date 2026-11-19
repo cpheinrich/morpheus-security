@@ -83,8 +83,9 @@ function output(name, value) {
 function summary(markdown) {
   const line = `${markdown.trim()}\n`;
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, line);
-  // Prefix every line so GitHub Actions treats remote error text as log data.
-  process.stdout.write(line.trimEnd().split("\n").map((part) => `Morpheus Security: ${part}\n`).join(""));
+  // Prefix modern workflow commands and neutralize the legacy marker, which can appear anywhere in a line.
+  const logLines = line.trimEnd().split(/\r\n?|\n/);
+  process.stdout.write(logLines.map((part) => `Morpheus Security: ${part.replaceAll("##[", "## [")}\n`).join(""));
 }
 
 function loadConfig() {

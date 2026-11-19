@@ -25,7 +25,7 @@ else if (endpoint?.includes("/statuses?")) console.log("[[]]");
 else if (args[0] === "pr") {
   appendFileSync(process.env.TEST_GH_WRITES, JSON.stringify(args) + "\\n");
   if (failMerge && args[1] === "merge") {
-    console.error("GitHub still requires approval\\n::error::fixture");
+    console.error("GitHub still requires approval\\r::error::fixture\\r\\nremote: ##[error]fixture");
     process.exitCode = 1;
   }
 } else throw new Error("Unexpected GitHub CLI call: " + args.join(" "));
@@ -143,7 +143,10 @@ describe("Security App pull request reconciliation", () => {
   it("records a GitHub refusal in private logs without executing workflow command text", () => {
     const result = runReconciliation({ draft: false, failMerge: true });
     expect(result.logs).toContain("GitHub still requires approval");
-    expect(result.logs).toContain("\nMorpheus Security: ::error::fixture)");
+    expect(result.logs).toContain("\nMorpheus Security: ::error::fixture\n");
+    expect(result.logs).toContain("\nMorpheus Security: remote: ## [error]fixture)");
+    expect(result.logs).not.toContain("##[");
+    expect(result.logs).not.toContain("\r");
     expect(result.outputs).toContain("merged=false\n");
   });
 });
